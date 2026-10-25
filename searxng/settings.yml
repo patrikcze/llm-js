@@ -1,0 +1,24 @@
+# Minimal SearXNG config for the agent's web_search tool.
+# Everything not listed here falls back to SearXNG's defaults.
+use_default_settings: true
+
+general:
+  instance_name: "llm-agent search"
+
+server:
+  # Overridden by SEARXNG_SECRET from docker-compose.yml.
+  secret_key: "overridden-by-env"
+  # The limiter needs Valkey/Redis; this instance only listens on 127.0.0.1, so it is not needed.
+  limiter: false
+  image_proxy: false
+  public_instance: false
+
+search:
+  safe_search: 0
+  # The agent uses the JSON API (format=json).
+  formats:
+    - html
+    - json
+
+ui:
+  static_use_hash: true

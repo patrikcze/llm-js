@@ -1,0 +1,43 @@
+# Full stack: agent web UI + local SearXNG search.
+#   docker compose up -d --build     ->  UI on http://127.0.0.1:8787
+#
+# The LLM is NOT in this stack. By default the agent talks to a server on your host
+# (llama.cpp / Ollama / LM Studio) through host.docker.internal, or to OpenAI / Anthropic
+# once you pick them in the UI's config window.
+services:
+  agent:
+    build: .
+    image: llm-agent:latest
+    container_name: llm-agent
+    restart: unless-stopped
+    depends_on:
+      - searxng
+    ports:
+      - "127.0.0.1:${AGENT_PORT:-8787}:8787" # localhost only
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Inside the container "localhost" is the container itself; reach the host's LLM server instead.
+      LLM_BASE_URL: ${DOCKER_LLM_BASE_URL:-http://host.docker.internal:9931/v1}
+      SEARXNG_URL: http://searxng:8080
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # needed on Linux; Docker Desktop provides it already
+    volumes:
+      - ${AGENT_WORKSPACE:-./playground}:/workspace
+      - agent-config:/config
+
+  searxng:
+    image: searxng/searxng:2026.10.25-54ca1d9cf
+    container_name: llm-agent-searxng
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8888:8080" # localhost only; lets the agent run outside Docker too
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    environment:
+      - SEARXNG_BASE_URL=http://127.0.0.1:8888/
+      - SEARXNG_SECRET=${SEARXNG_SECRET:-local-only-change-me}
+
+volumes:
+  agent-config:
