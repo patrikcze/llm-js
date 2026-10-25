@@ -104,6 +104,16 @@ AGENT_WORKSPACE=~/code/my-project AGENT_PORT=8800 docker compose up -d
 
 On Linux, the container user (uid 1000) needs write access to the mounted workspace.
 
+## Rich answers
+
+Answers are rendered as Markdown with:
+
+- **Math**: KaTeX, for `$…$`, `\(…\)` (inline) and `$$…$$`, `\[…\]` (display, also mid-sentence). Math is tokenised before Markdown, so `\\`, `_` and `*` inside formulas survive. Currency like `$5 and $10` stays plain text.
+- **Diagrams**: ```` ```mermaid ```` blocks render as SVG in the HUD colours (flowcharts, sequence, pie, git, …), with a Source toggle. Mermaid loads only when the first diagram appears and runs in its `strict` security mode. Syntax errors show the message and the source.
+- **Images**: rendered once the answer has finished streaming. **⚙ Config → Display** sets remote images to *Auto-load* (default), *Click to load*, or *Off*. Loading an image contacts its server, so a page the agent read could try to leak data through an image URL. *Click to load* shows the host first.
+
+KaTeX and Mermaid are served from `node_modules`, so this works offline and in Docker.
+
 ## Browser UI security
 
 - The server binds to `127.0.0.1` by default (`HOST=0.0.0.0` only inside the container).

@@ -7,6 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet">
+<link href="/vendor/katex.css" rel="stylesheet">
 <style>
   :root {
     --bg: #0b1212;
@@ -218,6 +219,36 @@
   .binary { font-size: 8.5px; letter-spacing: .12em; color: var(--dim); text-align: right; line-height: 1.5; display: flex; align-items: center; gap: 10px; }
   .binary svg { width: 34px; height: 34px; color: var(--accent); flex: none; }
   .hint { grid-column: 2; max-width: 860px; width: 100%; margin: 6px auto 0; font-size: 9.5px; letter-spacing: .18em; color: var(--faint); text-transform: uppercase; }
+
+  /* ---------- rich content: math, images, diagrams ---------- */
+  .katex { font-size: 1.08em; color: #e6f6f1; }
+  .math-block { overflow-x: auto; overflow-y: hidden; margin: 10px 0; padding: 4px 0; }
+  .math-display-inline { display: inline-block; max-width: 100%; overflow-x: auto; vertical-align: middle; }
+  .math-display-inline .katex-display { margin: 0; }
+  .math-error { color: var(--err); font-size: 12px; }
+  .assistant .body img {
+    display: block; max-width: 100%; height: auto; margin: 8px 0; border: 1px solid var(--line);
+    background: rgba(143,227,207,.04); min-height: 24px;
+  }
+  .assistant .body img.broken { display: none; }
+  .img-ph {
+    display: inline-flex; align-items: center; gap: 10px; margin: 6px 0; padding: 7px 12px; max-width: 100%;
+    border: 1px dashed var(--line-strong); color: var(--dim); font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
+  }
+  .img-ph b { color: var(--accent); font-weight: 500; text-transform: none; letter-spacing: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .img-ph button { padding: 3px 9px; font-size: 10px; }
+  .img-ph.err { border-color: rgba(255,122,107,.5); color: var(--err); }
+  .mermaid-box { position: relative; border: 1px solid var(--line); padding: 16px 14px 12px; margin: 10px 0; overflow-x: auto; background: rgba(143,227,207,.025); }
+  .mermaid-box::before { content: "DIAGRAM"; position: absolute; top: 4px; left: 10px; font-size: 9px; letter-spacing: .26em; color: var(--faint); }
+  .mermaid-box svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+  /* Mermaid uses class="label" too: keep the HUD label style out of diagrams. */
+  .mermaid-box svg .label { font-size: inherit; letter-spacing: normal; text-transform: none; color: inherit; }
+  .mermaid-box .src-toggle { position: absolute; top: 4px; right: 6px; padding: 2px 8px; font-size: 9.5px; }
+  .mermaid-box pre { margin: 6px 0 0; }
+  .mermaid-box.err { border-color: rgba(255,122,107,.5); }
+  .mermaid-box .label.errmsg { color: var(--err); text-transform: none; letter-spacing: .02em; }
+  .seg { display: flex; flex-wrap: wrap; gap: 6px; }
+  .seg button[aria-pressed="true"] { background: rgba(143,227,207,.12); border-color: var(--accent); box-shadow: 0 0 12px var(--accent-glow); }
 
   /* ---------- config dialog ---------- */
   .brand .label.link { cursor: pointer; } .brand .label.link:hover { color: var(--accent); }
@@ -444,6 +475,18 @@
           <span class="hint2" id="cfg-ctx-hint"></span></label>
       </div>
     </section>
+    <section class="cfg-sec">
+      <h3><b>05</b> // Display <span style="text-transform:none;letter-spacing:.04em">(saved in this browser, applies immediately)</span></h3>
+      <div class="field">
+        <span class="label">Remote images in answers</span>
+        <div class="seg" id="cfg-images" role="group" aria-label="Remote images">
+          <button type="button" data-v="auto">Auto-load</button>
+          <button type="button" data-v="click">Click to load</button>
+          <button type="button" data-v="off">Off</button>
+        </div>
+        <span class="hint2">Loading an image sends a request to its server. A malicious page the agent reads could try to smuggle data out through an image URL; "Click to load" shows the host first.</span>
+      </div>
+    </section>
   </form>
   <div class="cfg-foot">
     <span class="msg2" id="cfg-msg" role="status"></span>
@@ -454,6 +497,7 @@
 
 <script src="/vendor/marked.js"></script>
 <script src="/vendor/purify.js"></script>
+<script src="/vendor/katex.js"></script>
 <script>
 const $ = (id) => document.getElementById(id);
 const log = $("log"), scroller = $("scroll"), input = $("input"), sendBtn = $("send"), modeSel = $("mode");
@@ -516,8 +560,175 @@ function typewrite(lines) {
 
 // ---------------------------------------------------------------- helpers
 // Untrusted model output -> safe HTML. Links open in a new tab.
-DOMPurify.addHook("afterSanitizeAttributes", (n) => { if (n.tagName === "A") { n.target = "_blank"; n.rel = "noopener noreferrer"; } });
-const md = (s) => DOMPurify.sanitize(marked.parse(s, { gfm: true }));
+// ---------------------------------------------------------------- rich markdown
+function pref(k, d) { try { return localStorage.getItem("llm-agent." + k) ?? d; } catch { return d; } }
+function setPref(k, v) { try { localStorage.setItem("llm-agent." + k, v); } catch {} }
+const prefs = { images: pref("images", "auto") };
+
+const escapeHtml = (s) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+function renderMath(tex, display) {
+  try {
+    return katex.renderToString(tex, { displayMode: display, throwOnError: false, errorColor: "#ff7a6b", output: "html", strict: "ignore", trust: false, maxExpand: 500 });
+  } catch (e) {
+    return `<span class="math-error" title="${escapeHtml(e.message)}">${escapeHtml(tex)}</span>`;
+  }
+}
+
+// Math is tokenised before Markdown sees it, so "\\", "_" and "*" inside formulas survive.
+marked.use({
+  extensions: [
+    {
+      name: "mathBlock", level: "block",
+      start: (src) => src.match(/^ {0,3}(\$\$|\\\[)/m)?.index,
+      tokenizer(src) {
+        const m = /^ {0,3}\$\$([\s\S]+?)\$\$[ \t]*(?:\n+|$)/.exec(src) || /^ {0,3}\\\[([\s\S]+?)\\\][ \t]*(?:\n+|$)/.exec(src);
+        if (m) return { type: "mathBlock", raw: m[0], text: m[1].trim() };
+      },
+      renderer: (t) => `<div class="math-block">${renderMath(t.text, true)}</div>`,
+    },
+    {
+      name: "mathInline", level: "inline",
+      start: (src) => src.match(/\$|\\\(|\\\[/)?.index,
+      tokenizer(src) {
+        let m;
+        // $$…$$ or \[…\] in the middle of a sentence: display style, kept inline.
+        if ((m = /^\$\$([\s\S]+?)\$\$/.exec(src)) || (m = /^\\\[([\s\S]+?)\\\]/.exec(src))) {
+          return { type: "mathInline", raw: m[0], text: m[1].trim(), display: true };
+        }
+        if ((m = /^\\\(([\s\S]+?)\\\)/.exec(src))) return { type: "mathInline", raw: m[0], text: m[1].trim(), display: false };
+        // $…$: no space just inside the dollars and no digit right after, so "$5 and $10" stays text.
+        if ((m = /^\$(?![\s$])((?:\\.|[^\\$\n])+?)(?<!\s)\$(?!\d)/.exec(src))) {
+          return { type: "mathInline", raw: m[0], text: m[1], display: false };
+        }
+      },
+      renderer: (t) => (t.display ? `<span class="math-display-inline">${renderMath(t.text, true)}</span>` : renderMath(t.text, false)),
+    },
+  ],
+});
+
+// While a message streams it is re-rendered every frame, so remote images wait until it is
+// complete (otherwise every frame would refetch them; random-image services would flicker).
+let renderingFinal = true;
+DOMPurify.addHook("afterSanitizeAttributes", (n) => {
+  if (n.tagName === "A") { n.target = "_blank"; n.rel = "noopener noreferrer"; }
+  if (n.tagName === "IMG") {
+    n.setAttribute("referrerpolicy", "no-referrer");
+    n.setAttribute("loading", "lazy");
+    n.setAttribute("decoding", "async");
+    const src = n.getAttribute("src") ?? "";
+    if (/^https?:/i.test(src) && (!renderingFinal || prefs.images !== "auto")) {
+      n.setAttribute("data-src", src);
+      n.removeAttribute("src");
+      n.setAttribute("data-hold", renderingFinal ? prefs.images : "streaming");
+    }
+  }
+});
+function md(s, final = false) {
+  renderingFinal = final;
+  try { return DOMPurify.sanitize(marked.parse(s, { gfm: true })); } finally { renderingFinal = true; }
+}
+
+function hostOf(u) { try { return new URL(u).host; } catch { return u.slice(0, 60); } }
+
+/** Turns held images into placeholders and wires up error handling. */
+function enhanceImages(root) {
+  for (const img of root.querySelectorAll("img")) {
+    const fail = () => {
+      const ph = el("span", "img-ph err");
+      ph.append("✕ image failed", el("b", "", img.alt || hostOf(img.currentSrc || img.dataset.src || "")));
+      img.replaceWith(ph);
+    };
+    img.addEventListener("error", fail, { once: true });
+    const hold = img.dataset.hold;
+    if (!hold) continue;
+    if (hold === "streaming") { img.src = img.dataset.src; img.removeAttribute("data-hold"); continue; }
+    const ph = el("span", "img-ph");
+    ph.append(hold === "off" ? "▣ image hidden" : "▣ image", el("b", "", `${img.alt ? img.alt + " · " : ""}${hostOf(img.dataset.src)}`));
+    ph.title = img.dataset.src;
+    if (hold === "click") {
+      const load = el("button", "", "Load");
+      load.type = "button";
+      load.onclick = () => { img.src = img.dataset.src; img.removeAttribute("data-hold"); ph.replaceWith(img); };
+      ph.append(load);
+    }
+    img.replaceWith(ph);
+  }
+}
+
+// Mermaid is 5 MB: load it only when the first diagram shows up.
+let mermaidReady = null, mermaidSeq = 0;
+function loadMermaid() {
+  return (mermaidReady ??= new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "/vendor/mermaid.js";
+    s.onload = () => {
+      mermaid.initialize({
+        startOnLoad: false,
+        securityLevel: "strict",
+        theme: "base",
+        fontFamily: getComputedStyle(document.body).fontFamily,
+        // SVG text labels instead of HTML in <foreignObject>, which the sanitiser below would drop.
+        htmlLabels: false,
+        flowchart: { htmlLabels: false, curve: "basis" },
+        themeVariables: {
+          darkMode: true, fontSize: "13px", background: "transparent",
+          primaryColor: "#12201f", primaryTextColor: "#cfe7e0", primaryBorderColor: "#8fe3cf",
+          secondaryColor: "#162a28", secondaryTextColor: "#cfe7e0", secondaryBorderColor: "#5f8580",
+          tertiaryColor: "#0f1818", tertiaryTextColor: "#cfe7e0", tertiaryBorderColor: "#3c5752",
+          lineColor: "#6e928b", textColor: "#cfe7e0", mainBkg: "#12201f", nodeBorder: "#8fe3cf",
+          clusterBkg: "rgba(143,227,207,0.04)", clusterBorder: "#3c5752", titleColor: "#8fe3cf",
+          edgeLabelBackground: "#0b1212", noteBkgColor: "#1b2a22", noteTextColor: "#e9dfc0", noteBorderColor: "#e9c46a",
+          actorBkg: "#12201f", actorBorder: "#8fe3cf", actorTextColor: "#cfe7e0", signalColor: "#8fe3cf", signalTextColor: "#cfe7e0",
+          labelBoxBkgColor: "#12201f", labelBoxBorderColor: "#8fe3cf", labelTextColor: "#cfe7e0", loopTextColor: "#cfe7e0",
+          pie1: "#8fe3cf", pie2: "#5fb3a1", pie3: "#e9c46a", pie4: "#ff7a6b", pie5: "#6b9cf0", pie6: "#3c5752",
+          pieStrokeColor: "#0b1212", pieSectionTextColor: "#0b1212", pieTitleTextColor: "#8fe3cf", pieLegendTextColor: "#cfe7e0",
+          gridColor: "#3c5752", git0: "#8fe3cf", git1: "#e9c46a", git2: "#6b9cf0", git3: "#ff7a6b",
+        },
+      });
+      resolve(window.mermaid);
+    };
+    s.onerror = () => { mermaidReady = null; reject(new Error("could not load /vendor/mermaid.js")); };
+    document.head.append(s);
+  }));
+}
+
+async function renderDiagrams(root) {
+  const blocks = [...root.querySelectorAll("pre > code.language-mermaid")];
+  if (!blocks.length) return;
+  let m;
+  try { m = await loadMermaid(); } catch (e) { return; }
+  for (const code of blocks) {
+    const pre = code.parentElement;
+    if (!pre?.isConnected) continue;
+    const source = code.textContent;
+    const box = el("div", "mermaid-box");
+    const id = "mmd-" + ++mermaidSeq;
+    try {
+      const { svg } = await m.render(id, source);
+      // Mermaid's strict mode already sanitises labels; sanitise the SVG once more for defence in depth.
+      box.innerHTML = DOMPurify.sanitize(svg, { USE_PROFILES: { svg: true, svgFilters: true }, ADD_TAGS: ["style"] });
+      const toggle = el("button", "src-toggle", "Source");
+      toggle.type = "button";
+      const srcPre = pre.cloneNode(true);
+      srcPre.hidden = true;
+      toggle.onclick = () => { srcPre.hidden = !srcPre.hidden; toggle.textContent = srcPre.hidden ? "Source" : "Diagram"; box.querySelector("svg").style.display = srcPre.hidden ? "" : "none"; };
+      box.append(toggle, srcPre);
+    } catch (e) {
+      box.classList.add("err");
+      box.append(el("div", "label errmsg", "Mermaid error: " + short(e?.message ?? String(e), 220)), pre.cloneNode(true));
+    } finally {
+      document.getElementById("d" + id)?.remove(); // mermaid leaves its scratch node behind on errors
+    }
+    pre.replaceWith(box);
+    stick();
+  }
+}
+
+/** Final pass over a finished message: images and diagrams. */
+function enhance(root) {
+  enhanceImages(root);
+  renderDiagrams(root);
+}
 
 function el(tag, cls, text) {
   const e = document.createElement(tag);
@@ -593,7 +804,12 @@ async function run(message_) {
   let textBody = null, textBuf = "", thinkBlock = null, frame = 0, steps = 0, sawText = false;
   const tools = new Map();
   const flushText = () => { frame = 0; if (textBody) { textBody.innerHTML = md(textBuf); stick(); } };
-  const endText = () => { if (frame) { cancelAnimationFrame(frame); flushText(); } textBody = null; textBuf = ""; thinkBlock = null; };
+  const endText = () => {
+    if (frame) cancelAnimationFrame(frame);
+    frame = 0;
+    if (textBody) { textBody.innerHTML = md(textBuf, true); enhance(textBody); stick(); }
+    textBody = null; textBuf = ""; thinkBlock = null;
+  };
 
   const handlers = {
     reasoning(d) {
@@ -659,7 +875,7 @@ async function run(message_) {
     done(r) {
       endText();
       if (r.text && !sawText) {
-        const [box, body] = message("assistant", "◇ Agent"); body.innerHTML = md(r.text); add(box);
+        const [box, body] = message("assistant", "◇ Agent"); body.innerHTML = md(r.text, true); add(box); enhance(body);
       }
       const reason = r.stopReason === "completed" ? "complete" : r.stopReason;
       add(el("div", "stats", `${r.steps} steps · ${r.toolCalls.length} tool calls · ${r.usage.promptTokens}+${r.usage.completionTokens} tokens · ${reason}`));
@@ -823,6 +1039,13 @@ $("cfg-apply").onclick = async () => {
     $("cfg-apply").disabled = false;
   }
 };
+function syncImagePref() {
+  for (const b of $("cfg-images").children) b.setAttribute("aria-pressed", String(b.dataset.v === prefs.images));
+}
+for (const b of $("cfg-images").children) {
+  b.onclick = () => { prefs.images = b.dataset.v; setPref("images", prefs.images); syncImagePref(); };
+}
+syncImagePref();
 $("open-config").onclick = openConfig;
 $("sub").onclick = openConfig;
 

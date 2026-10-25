@@ -129,7 +129,26 @@ const STATIC: Record<string, [string, string]> = {
   "/": ["web/index.html", "text/html; charset=utf-8"],
   "/vendor/marked.js": ["node_modules/marked/lib/marked.umd.js", "text/javascript"],
   "/vendor/purify.js": ["node_modules/dompurify/dist/purify.min.js", "text/javascript"],
+  "/vendor/katex.js": ["node_modules/katex/dist/katex.min.js", "text/javascript"],
+  "/vendor/katex.css": ["node_modules/katex/dist/katex.min.css", "text/css"],
+  "/vendor/mermaid.js": ["node_modules/mermaid/dist/mermaid.min.js", "text/javascript"],
 };
+// KaTeX's stylesheet loads its fonts from fonts/ next to it.
+const FONT_TYPES: Record<string, string> = { woff2: "font/woff2", woff: "font/woff", ttf: "font/ttf" };
+
+function staticFile(url: URL): [string, string] | undefined {
+  if (STATIC[url.pathname]) return STATIC[url.pathname];
+  const font = /^\/vendor\/fonts\/(KaTeX_[A-Za-z0-9_-]+\.(woff2|woff|ttf))$/.exec(url.pathname);
+  if (font) return [`node_modules/katex/dist/fonts/${font[1]}`, FONT_TYPES[font[2]!]!];
+  return undefined;
+}
+
+// Remote images are allowed (http/https) so Markdown images render; the page decides whether
+// to load them automatically (see "Remote images" in the config window).
+const CSP =
+  "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+  "font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https: http:; connect-src 'self'; " +
+  "object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
 
 function json(res: ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" }).end(JSON.stringify(body));
@@ -159,18 +178,18 @@ const server = createServer(async (req, res) => {
   try {
     if (req.method === "GET" && url.pathname === "/healthz") return json(res, 200, { ok: true });
 
-    if (req.method === "GET" && STATIC[url.pathname]) {
+    const asset = req.method === "GET" ? staticFile(url) : undefined;
+    if (asset) {
       if (!sameOrigin(req)) return json(res, 403, { error: "forbidden" });
-      const [file, type] = STATIC[url.pathname]!;
+      const [file, type] = asset;
       return res
         .writeHead(200, {
           "content-type": type,
-          "cache-control": "no-store",
+          // Vendor files are immutable per install; the page itself must always be fresh.
+          "cache-control": file.startsWith("node_modules/") ? "public, max-age=86400" : "no-store",
           "x-content-type-options": "nosniff",
           "referrer-policy": "no-referrer",
-          "content-security-policy":
-            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
-            "font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'",
+          "content-security-policy": CSP,
         })
         .end(await readFile(path.join(ROOT, file)));
     }
