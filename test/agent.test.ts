@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { parseArgs } from "../src/agent.ts";
@@ -363,6 +364,66 @@ describe("workspace sandbox", () => {
         },
       );
       await t.agent.run("escape");
+    } finally {
+      await t.cleanup();
+    }
+  });
+});
+
+describe("symlink escapes", () => {
+  const ctxFor = (workspace: string) => ({ workspace, signal: new AbortController().signal });
+
+  it("search_files and find_files never read or list through links that leave the workspace", async () => {
+    const t = await setup();
+    const outside = await mkdtemp(path.join(os.tmpdir(), "agent-outside-"));
+    try {
+      await writeFile(path.join(outside, "secret.txt"), "TOP_SECRET_TOKEN\n");
+      await mkdir(path.join(outside, "dir"));
+      await writeFile(path.join(outside, "dir", "inner.txt"), "TOP_SECRET_TOKEN\n");
+      await symlink(path.join(outside, "secret.txt"), path.join(t.workspace, "link.txt"));
+      await symlink(path.join(outside, "dir"), path.join(t.workspace, "linkdir"));
+      await writeFile(path.join(t.workspace, "ok.txt"), "TOP_SECRET_TOKEN is mentioned here\n");
+      const search = fsTools.find((x) => x.name === "search_files")!;
+      const find = fsTools.find((x) => x.name === "find_files")!;
+      const hits = await search.run({ query: "TOP_SECRET_TOKEN" }, ctxFor(t.workspace));
+      assert.equal(hits, "ok.txt:1: TOP_SECRET_TOKEN is mentioned here");
+      const files = await find.run({ pattern: "**/*.txt" }, ctxFor(t.workspace));
+      assert.equal(files, "ok.txt");
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+      await t.cleanup();
+    }
+  });
+
+  it("refuses to write through dangling symlinks (file or directory)", async () => {
+    const t = await setup();
+    const outside = await mkdtemp(path.join(os.tmpdir(), "agent-outside-"));
+    try {
+      await symlink(path.join(outside, "planted.txt"), path.join(t.workspace, "evil.txt"));
+      await symlink(path.join(outside, "missing-dir"), path.join(t.workspace, "evildir"));
+      const write = fsTools.find((x) => x.name === "write_file")!;
+      const mkdirTool = fsTools.find((x) => x.name === "make_dir")!;
+      for (const p of ["evil.txt", "evildir/x.txt"]) {
+        await assert.rejects(write.describe!({ path: p, content: "x" }, ctxFor(t.workspace)), /broken symlink/, p);
+        await assert.rejects(write.run({ path: p, content: "x" }, ctxFor(t.workspace)), /broken symlink/, p);
+      }
+      await assert.rejects(mkdirTool.run({ path: "evildir/sub" }, ctxFor(t.workspace)), /broken symlink/);
+      await assert.rejects(readFile(path.join(outside, "planted.txt")));
+      await assert.rejects(readFile(path.join(outside, "missing-dir", "x.txt")));
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+      await t.cleanup();
+    }
+  });
+
+  it("still writes through symlinks that stay inside the workspace", async () => {
+    const t = await setup();
+    try {
+      await mkdir(path.join(t.workspace, "real"));
+      await symlink(path.join(t.workspace, "real"), path.join(t.workspace, "alias"));
+      const write = fsTools.find((x) => x.name === "write_file")!;
+      await write.run({ path: "alias/a.txt", content: "hi" }, ctxFor(t.workspace));
+      assert.equal(await readFile(path.join(t.workspace, "real", "a.txt"), "utf8"), "hi");
     } finally {
       await t.cleanup();
     }

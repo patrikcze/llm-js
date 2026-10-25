@@ -1,8 +1,10 @@
+import { lookup as dnsLookup, type LookupAddress } from "node:dns";
 import { lookup } from "node:dns/promises";
-import { isIP } from "node:net";
+import { BlockList, isIP, type LookupFunction } from "node:net";
 import { Readability } from "@mozilla/readability";
 import { parseHTML } from "linkedom";
 import TurndownService from "turndown";
+import { Agent, fetch as undiciFetch } from "undici";
 import { ToolError, truncate, type Tool, type ToolContext } from "./types.ts";
 
 const USER_AGENT =
@@ -15,33 +17,70 @@ const DEFAULT_FETCH_CHARS = 20_000;
 // Safe HTTP
 // ---------------------------------------------------------------------------
 
-function isPrivateAddress(ip: string): boolean {
-  if (isIP(ip) === 6) {
-    const v = ip.toLowerCase();
-    if (v === "::1" || v === "::") return true;
-    if (v.startsWith("fc") || v.startsWith("fd") || v.startsWith("fe80")) return true;
-    const mapped = v.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-    return mapped ? isPrivateAddress(mapped[1]!) : false;
-  }
-  const [a, b] = ip.split(".").map(Number) as [number, number];
-  return (
-    a === 10 || a === 127 || a === 0 ||
-    (a === 169 && b === 254) ||
-    (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 168) ||
-    (a === 100 && b >= 64 && b <= 127)
-  );
+// Everything that is not the public internet. BlockList matches any textual form of an address,
+// so "::ffff:7f00:1", "::ffff:127.0.0.1" and "0:0:0:0:0:ffff:7f00:1" are all caught.
+// Two lists: BlockList also matches IPv4 addresses against IPv6 rules (as ::a.b.c.d), so a single
+// list containing ::/96 would flag every IPv4 address.
+const BLOCKED_V4 = new BlockList();
+const BLOCKED_V6 = new BlockList();
+for (const [net, bits] of [
+  ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8], ["169.254.0.0", 16],
+  ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.0.2.0", 24], ["192.168.0.0", 16], ["198.18.0.0", 15],
+  ["198.51.100.0", 24], ["203.0.113.0", 24], ["224.0.0.0", 4], ["240.0.0.0", 4],
+] as const) BLOCKED_V4.addSubnet(net, bits, "ipv4");
+for (const [net, bits] of [
+  ["::", 96], // unspecified, loopback and IPv4-compatible (::a.b.c.d)
+  ["::ffff:0:0", 96], // IPv4-mapped
+  ["64:ff9b::", 96], ["64:ff9b:1::", 48], // NAT64: embeds an IPv4 address
+  ["100::", 64], // discard
+  ["2001:db8::", 32], // documentation
+  ["2002::", 16], // 6to4: embeds an IPv4 address
+  ["fc00::", 7], // unique local
+  ["fe80::", 10], // link-local
+  ["fec0::", 10], // site-local (deprecated)
+  ["ff00::", 8], // multicast
+] as const) BLOCKED_V6.addSubnet(net, bits, "ipv6");
+
+export function isPrivateAddress(ip: string): boolean {
+  const family = isIP(ip);
+  if (family === 0) return true; // not an address: refuse rather than guess
+  return family === 6 ? BLOCKED_V6.check(ip, "ipv6") : BLOCKED_V4.check(ip, "ipv4");
 }
+
+const privateFetchAllowed = () => process.env.AGENT_ALLOW_PRIVATE_FETCH === "1";
+
+/**
+ * DNS lookup used for the actual connection. Rejects private answers, so the socket can only
+ * reach an address that passed the check (no DNS-rebinding window between check and connect).
+ */
+export const guardedLookup: LookupFunction = (hostname, options, callback) => {
+  dnsLookup(hostname, { ...options, all: true }, (err, addresses) => {
+    if (err) return callback(err, "", 0);
+    const list = addresses as LookupAddress[];
+    if (!privateFetchAllowed()) {
+      const bad = list.find((a) => isPrivateAddress(a.address));
+      if (bad) {
+        const e = Object.assign(new Error(`${hostname} resolves to a private/local address (${bad.address})`), { code: "ERR_PRIVATE_ADDRESS" });
+        return callback(e, "", 0);
+      }
+    }
+    if (options.all) return (callback as any)(null, list);
+    callback(null, list[0]!.address, list[0]!.family);
+  });
+};
+
+const dispatcher = new Agent({ connect: { lookup: guardedLookup } });
 
 /**
  * Pages the model reads can tell it to fetch anything, so by default we refuse to reach
  * localhost and private networks. Set AGENT_ALLOW_PRIVATE_FETCH=1 to lift that.
+ * This check gives a clear early error; `guardedLookup` enforces it at connect time.
  */
 async function assertPublicUrl(url: URL): Promise<void> {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new ToolError(`Only http(s) URLs are supported, got ${url.protocol}`);
   }
-  if (process.env.AGENT_ALLOW_PRIVATE_FETCH === "1") return;
+  if (privateFetchAllowed()) return;
   const host = url.hostname.replace(/^\[|\]$/g, "");
   const addrs = isIP(host) ? [{ address: host }] : await lookup(host, { all: true }).catch(() => []);
   if (addrs.length === 0) throw new ToolError(`Could not resolve host ${url.hostname}`);
@@ -50,7 +89,9 @@ async function assertPublicUrl(url: URL): Promise<void> {
   }
 }
 
-async function safeFetch(rawUrl: string, ctx: ToolContext, init: RequestInit = {}): Promise<Response> {
+type FetchResponse = Awaited<ReturnType<typeof undiciFetch>>;
+
+async function safeFetch(rawUrl: string, ctx: ToolContext, init: { method?: string; headers?: Record<string, string>; body?: string } = {}): Promise<FetchResponse> {
   let url: URL;
   try {
     url = new URL(rawUrl);
@@ -61,21 +102,24 @@ async function safeFetch(rawUrl: string, ctx: ToolContext, init: RequestInit = {
   // Follow redirects by hand so every hop goes through the address check.
   for (let hop = 0; hop < 6; hop++) {
     await assertPublicUrl(url);
-    let res: Response;
+    let res: FetchResponse;
     try {
-      res = await fetch(url, {
+      res = await undiciFetch(url, {
         ...init,
         redirect: "manual",
         signal,
+        dispatcher,
         headers: { "User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9", ...init.headers },
       });
     } catch (e: any) {
       if (e.name === "TimeoutError") throw new ToolError(`Timed out fetching ${url}`);
       if (e.name === "AbortError") throw e;
+      if (e.cause?.code === "ERR_PRIVATE_ADDRESS") throw new ToolError(`Refusing to fetch ${url.hostname}: ${e.cause.message}.`);
       throw new ToolError(`Network error fetching ${url}: ${e.cause?.code ?? e.message}`);
     }
     const location = res.headers.get("location");
     if (res.status >= 300 && res.status < 400 && location) {
+      await res.body?.cancel();
       url = new URL(location, url);
       init = { ...init, method: "GET", body: undefined };
       continue;
@@ -85,7 +129,7 @@ async function safeFetch(rawUrl: string, ctx: ToolContext, init: RequestInit = {
   throw new ToolError(`Too many redirects for ${rawUrl}`);
 }
 
-async function readBody(res: Response): Promise<string> {
+async function readBody(res: FetchResponse): Promise<string> {
   const reader = res.body?.getReader();
   if (!reader) return "";
   const chunks: Uint8Array[] = [];

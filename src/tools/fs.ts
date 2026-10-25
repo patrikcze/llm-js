@@ -1,5 +1,5 @@
-import { realpathSync } from "node:fs";
-import { mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { constants, realpathSync } from "node:fs";
+import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat } from "node:fs/promises";
 import { glob } from "node:fs/promises";
 import path from "node:path";
 import { ToolError, truncate, type Tool, type ToolContext } from "./types.ts";
@@ -25,6 +25,11 @@ export async function resolveInWorkspace(ctx: ToolContext, p: string): Promise<s
       existing = await realpath(existing);
       break;
     } catch {
+      // realpath fails on a missing path, but also on a symlink whose target is missing.
+      // Following such a link on write would create a file wherever it points: refuse it.
+      if ((await lstat(existing).catch(() => null))?.isSymbolicLink()) {
+        throw new ToolError(`Path "${p}" goes through a broken symlink (${existing}); refusing to follow it.`);
+      }
       const parent = path.dirname(existing);
       if (parent === existing) break;
       tail.unshift(path.basename(existing));
@@ -36,6 +41,33 @@ export async function resolveInWorkspace(ctx: ToolContext, p: string): Promise<s
     throw new ToolError(`Path "${p}" is outside the workspace (${ctx.workspace}). Use paths relative to the workspace.`);
   }
   return real;
+}
+
+/** Real path of `full` if it stays inside `root` (a realpath'd workspace), else null. */
+async function realInside(root: string, full: string): Promise<string | null> {
+  const real = await realpath(full).catch(() => null);
+  return real && (real === root || real.startsWith(root + path.sep)) ? real : null;
+}
+
+/**
+ * Writes `data` to an already-validated path without following a symlink at the last component,
+ * after re-checking that the parent directory still resolves to the same place. This closes the
+ * window in which a link could be swapped in between validation and the write.
+ */
+async function writeInWorkspace(ctx: ToolContext, p: string, file: string, data: string): Promise<void> {
+  if ((await resolveInWorkspace(ctx, p)) !== file) throw new ToolError(`Path "${p}" changed while writing; aborted.`);
+  let fh;
+  try {
+    fh = await open(file, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | (constants.O_NOFOLLOW ?? 0), 0o644);
+  } catch (e: any) {
+    if (e.code === "ELOOP") throw new ToolError(`Refusing to write through a symlink: ${p}`);
+    throw e;
+  }
+  try {
+    await fh.writeFile(data, "utf8");
+  } finally {
+    await fh.close();
+  }
 }
 
 function rel(ctx: ToolContext, abs: string): string {
@@ -159,7 +191,7 @@ export const writeFileTool: Tool<{ path: string; content: string }> = {
     const file = await resolveInWorkspace(ctx, p);
     const existed = await exists(file);
     await mkdir(path.dirname(file), { recursive: true });
-    await writeFile(file, content, "utf8");
+    await writeInWorkspace(ctx, p, file, content);
     return `${existed ? "Overwrote" : "Created"} ${rel(ctx, file)} (${content.split("\n").length} lines).`;
   },
 };
@@ -212,7 +244,7 @@ export const editFileTool: Tool<EditArgs> = {
   },
   async run(args, ctx) {
     const { file, updated, replacements } = await planEdit(args, ctx);
-    await writeFile(file, updated, "utf8");
+    await writeInWorkspace(ctx, args.path, file, updated);
     return `Edited ${rel(ctx, file)}: ${replacements} replacement(s).`;
   },
 };
@@ -292,11 +324,14 @@ export const findFilesTool: Tool<{ pattern: string; path?: string }> = {
   },
   async run({ pattern, path: p = "." }, ctx) {
     const base = await resolveInWorkspace(ctx, p);
+    const root = await realpath(ctx.workspace);
     const out: string[] = [];
     for await (const m of glob(pattern, {
       cwd: base,
       exclude: (f: string) => SKIP_DIRS.has(path.basename(f)),
     })) {
+      // Skip matches that only exist through a symlink pointing outside the workspace.
+      if (!(await realInside(root, path.join(base, m)))) continue;
       out.push(rel(ctx, path.join(base, m)));
       if (out.length >= MAX_LIST_ENTRIES) break;
     }
@@ -331,17 +366,21 @@ export const searchFilesTool: Tool<{ query: string; path?: string; regex?: boole
     } catch (e: any) {
       throw new ToolError(`Invalid regex: ${e.message}`);
     }
+    const root = await realpath(ctx.workspace);
     const out: string[] = [];
     for await (const m of glob(include, { cwd: base, exclude: (f: string) => SKIP_DIRS.has(path.basename(f)) })) {
       if (ctx.signal.aborted || out.length >= MAX_GREP_MATCHES) break;
-      const full = path.join(base, m);
+      // Read through the real path, and never outside the workspace (symlinked files or dirs).
+      const shown = path.join(base, m);
+      const full = await realInside(root, shown);
+      if (!full) continue;
       const st = await stat(full).catch(() => null);
       if (!st?.isFile() || st.size > 2_000_000) continue;
       const buf = await readFile(full).catch(() => null);
       if (!buf || (await isBinary(buf))) continue;
       const lines = buf.toString("utf8").split("\n");
       for (let i = 0; i < lines.length && out.length < MAX_GREP_MATCHES; i++) {
-        if (re.test(lines[i]!)) out.push(`${rel(ctx, full)}:${i + 1}: ${lines[i]!.trim().slice(0, 300)}`);
+        if (re.test(lines[i]!)) out.push(`${rel(ctx, shown)}:${i + 1}: ${lines[i]!.trim().slice(0, 300)}`);
       }
     }
     if (out.length === 0) return `No matches for ${JSON.stringify(query)}.`;

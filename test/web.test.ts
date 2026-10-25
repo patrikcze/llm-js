@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, before, describe, it } from "node:test";
-import { htmlToMarkdown, webFetchTool } from "../src/tools/web.ts";
+import { guardedLookup, htmlToMarkdown, isPrivateAddress, webFetchTool } from "../src/tools/web.ts";
 
 const ctx = { workspace: process.cwd(), signal: new AbortController().signal };
 
@@ -20,6 +20,25 @@ describe("htmlToMarkdown", () => {
     assert.match(markdown, /quick brown fox/);
     assert.match(markdown, /\[more details\]\(https:\/\/example\.com\/more\)/);
     assert.doesNotMatch(markdown, /alert/);
+  });
+});
+
+describe("isPrivateAddress", () => {
+  it("catches every encoding of local/private addresses", () => {
+    for (const ip of [
+      "127.0.0.1", "10.1.2.3", "172.31.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0", "224.0.0.1",
+      "::1", "::", "::ffff:127.0.0.1", "::ffff:7f00:1", "0:0:0:0:0:ffff:7f00:1", "::127.0.0.1",
+      "64:ff9b::7f00:1", "2002:7f00:1::", "fd00::1", "fe80::1", "fec0::1", "ff02::1", "not-an-ip",
+    ]) assert.equal(isPrivateAddress(ip), true, ip);
+    for (const ip of ["1.1.1.1", "8.8.8.8", "93.184.216.34", "2606:4700:4700::1111", "2a00:1450:4001::200e"]) {
+      assert.equal(isPrivateAddress(ip), false, ip);
+    }
+  });
+
+  it("pins connections: the lookup used to connect refuses private answers", async () => {
+    delete process.env.AGENT_ALLOW_PRIVATE_FETCH;
+    const err = await new Promise<any>((resolve) => guardedLookup("localhost", {}, (e) => resolve(e)));
+    assert.equal(err?.code, "ERR_PRIVATE_ADDRESS");
   });
 });
 
@@ -44,6 +63,17 @@ describe("web_fetch", () => {
     await assert.rejects(webFetchTool.run({ url: `${base}/page` }, ctx), /private\/local address/);
     await assert.rejects(webFetchTool.run({ url: "http://169.254.169.254/latest/meta-data" }, ctx), /private/);
     await assert.rejects(webFetchTool.run({ url: "file:///etc/passwd" }, ctx), /Only http/);
+    const port = new URL(base).port;
+    for (const u of [
+      `http://[::ffff:127.0.0.1]:${port}/page`, // URL normalises this to [::ffff:7f00:1]
+      `http://[0:0:0:0:0:ffff:7f00:1]:${port}/page`,
+      `http://[::1]:${port}/page`,
+      `http://[64:ff9b::7f00:1]:${port}/page`,
+      `http://2130706433:${port}/page`, // decimal 127.0.0.1
+      `http://0x7f.1:${port}/page`,
+      `http://0.0.0.0:${port}/page`,
+      `http://localhost:${port}/page`,
+    ]) await assert.rejects(webFetchTool.run({ url: u }, ctx), /private\/local address/, u);
   });
 
   it("fetches, follows redirects, converts, paginates and reports errors", async () => {
