@@ -19,7 +19,8 @@ import { COMMON_HELP, COMMON_OPTIONS, ConfigError, MODES, parseArgs, resolveConf
 import { createChatClient, PROVIDERS, ProviderError, type ProviderKind } from "./providers.ts";
 import { loadSettings, publicProviders, saveSettings, settingsPath, type SavedSettings } from "./settings.ts";
 import { fsTools } from "./tools/fs.ts";
-import { searchProviderName, webTools } from "./tools/web.ts";
+import { ToolError } from "./tools/types.ts";
+import { fetchImage, searchProviderName, webTools } from "./tools/web.ts";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -45,6 +46,9 @@ const allowedHosts = new Set(["127.0.0.1", "localhost", ...(process.env.AGENT_AL
 // --- state (one local user, one conversation) -------------------------------
 
 let active = { provider: cfg.provider, baseURL: cfg.baseURL };
+// Capability for /api/image. The page reads it from /api/info (JSON other sites cannot read), so
+// model output cannot build working proxy URLs (e.g. CSS url(/api/image?...)) on its own.
+const imageToken = randomUUID();
 type Send = (event: string, data: unknown) => void;
 let send: Send | null = null;
 let running: AbortController | null = null;
@@ -99,6 +103,7 @@ function info() {
     busy: Boolean(running),
     tokens: agent.estimateTokens(),
     contextTokens: agent.contextTokens,
+    imageToken,
   };
 }
 
@@ -143,11 +148,12 @@ function staticFile(url: URL): [string, string] | undefined {
   return undefined;
 }
 
-// Remote images are allowed (http/https) so Markdown images render; the page decides whether
-// to load them automatically (see "Remote images" in the config window).
+// No remote images at the CSP level: the browser blocks every way model output could load one
+// (img srcset, CSS url(), SVG <image>, video poster…). Images the user's policy allows are loaded
+// through /api/image instead, so that policy is the only path.
 const CSP =
   "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
-  "font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https: http:; connect-src 'self'; " +
+  "font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; media-src 'none'; connect-src 'self'; " +
   "object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
 
 function json(res: ServerResponse, status: number, body: unknown) {
@@ -197,6 +203,31 @@ const server = createServer(async (req, res) => {
     if (!sameOrigin(req)) return json(res, 403, { error: "cross-origin request refused" });
 
     if (req.method === "GET" && url.pathname === "/api/info") return json(res, 200, info());
+
+    // Same-origin image proxy for Markdown images the page decided to load.
+    if (req.method === "GET" && url.pathname === "/api/image") {
+      // Only this page may use it (browsers send Sec-Fetch-Site on every request).
+      const site = req.headers["sec-fetch-site"];
+      if (site && site !== "same-origin") return json(res, 403, { error: "forbidden" });
+      if (url.searchParams.get("t") !== imageToken) return json(res, 403, { error: "forbidden" });
+      const target = url.searchParams.get("url") ?? "";
+      const ac = new AbortController();
+      res.on("close", () => ac.abort());
+      try {
+        const img = await fetchImage(target, AbortSignal.any([ac.signal, AbortSignal.timeout(20_000)]));
+        res.writeHead(200, {
+          "content-type": img.type,
+          "content-length": img.body.length,
+          "cache-control": "private, max-age=600",
+          "x-content-type-options": "nosniff",
+          "content-security-policy": "default-src 'none'; sandbox",
+        });
+        return res.end(img.body);
+      } catch (e: any) {
+        if (ac.signal.aborted) return;
+        return json(res, 502, { error: e instanceof ToolError ? e.message : "image fetch failed" });
+      }
+    }
 
     if (req.method === "POST" && url.pathname === "/api/run") {
       const { message } = await body(req);

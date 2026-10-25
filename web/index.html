@@ -484,7 +484,7 @@
           <button type="button" data-v="click">Click to load</button>
           <button type="button" data-v="off">Off</button>
         </div>
-        <span class="hint2">Loading an image sends a request to its server. A malicious page the agent reads could try to smuggle data out through an image URL; "Click to load" shows the host first.</span>
+        <span class="hint2">Images load through this server (the image host never sees your browser), but loading one still sends its URL out. A malicious page the agent reads could try to smuggle data out through an image URL; "Click to load" shows the host first. Nothing else in an answer can load remote content.</span>
       </div>
     </section>
   </form>
@@ -565,6 +565,7 @@ function pref(k, d) { try { return localStorage.getItem("llm-agent." + k) ?? d; 
 function setPref(k, v) { try { localStorage.setItem("llm-agent." + k, v); } catch {} }
 const prefs = { images: pref("images", "auto") };
 
+// @math-start (test/markdown.test.ts runs this block under Node)
 const escapeHtml = (s) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 function renderMath(tex, display) {
   try {
@@ -606,20 +607,30 @@ marked.use({
   ],
 });
 
-// While a message streams it is re-rendered every frame, so remote images wait until it is
-// complete (otherwise every frame would refetch them; random-image services would flicker).
+// @math-end
+
+// Remote images never load directly: the page CSP only allows same-origin images, and the
+// same-origin /api/image proxy needs a token only this script knows. So every remote image goes
+// through enhanceImages(), which applies the user's policy. Images also wait until a message has
+// finished streaming (it is re-rendered every frame; random-image services would flicker).
 let renderingFinal = true;
+let imageToken = "";
+const proxied = (u) => `/api/image?t=${encodeURIComponent(imageToken)}&url=${encodeURIComponent(u)}`;
 DOMPurify.addHook("afterSanitizeAttributes", (n) => {
   if (n.tagName === "A") { n.target = "_blank"; n.rel = "noopener noreferrer"; }
+  n.removeAttribute("srcset");
+  n.removeAttribute("sizes");
   if (n.tagName === "IMG") {
     n.setAttribute("referrerpolicy", "no-referrer");
     n.setAttribute("loading", "lazy");
     n.setAttribute("decoding", "async");
     const src = n.getAttribute("src") ?? "";
-    if (/^https?:/i.test(src) && (!renderingFinal || prefs.images !== "auto")) {
+    n.removeAttribute("src");
+    if (/^https?:/i.test(src)) {
       n.setAttribute("data-src", src);
-      n.removeAttribute("src");
       n.setAttribute("data-hold", renderingFinal ? prefs.images : "streaming");
+    } else if (/^data:image\/(png|jpe?g|gif|webp|avif);/i.test(src)) {
+      n.setAttribute("src", src); // inline images carry no request
     }
   }
 });
@@ -641,14 +652,15 @@ function enhanceImages(root) {
     img.addEventListener("error", fail, { once: true });
     const hold = img.dataset.hold;
     if (!hold) continue;
-    if (hold === "streaming") { img.src = img.dataset.src; img.removeAttribute("data-hold"); continue; }
+    if (hold === "streaming") continue; // a final render follows
+    if (hold === "auto") { img.src = proxied(img.dataset.src); img.removeAttribute("data-hold"); continue; }
     const ph = el("span", "img-ph");
     ph.append(hold === "off" ? "▣ image hidden" : "▣ image", el("b", "", `${img.alt ? img.alt + " · " : ""}${hostOf(img.dataset.src)}`));
     ph.title = img.dataset.src;
     if (hold === "click") {
       const load = el("button", "", "Load");
       load.type = "button";
-      load.onclick = () => { img.src = img.dataset.src; img.removeAttribute("data-hold"); ph.replaceWith(img); };
+      load.onclick = () => { img.src = proxied(img.dataset.src); img.removeAttribute("data-hold"); ph.replaceWith(img); };
       ph.append(load);
     }
     img.replaceWith(ph);
@@ -767,6 +779,7 @@ working.append(el("div", "mini-orbit"), workingText);
 const status = (t) => (workingText.textContent = t);
 
 function showInfo(i) {
+  if (i.imageToken) imageToken = i.imageToken;
   ctxMax = i.contextTokens ?? ctxMax;
   $("sub").textContent = i.model ? `${i.providerLabel} · ${i.model}` : "No model selected · open config";
   $("r-provider").textContent = i.providerLabel;

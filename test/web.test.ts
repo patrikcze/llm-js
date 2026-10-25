@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, before, describe, it } from "node:test";
-import { guardedLookup, htmlToMarkdown, isPrivateAddress, webFetchTool } from "../src/tools/web.ts";
+import { fetchImage, guardedLookup, htmlToMarkdown, isPrivateAddress, webFetchTool } from "../src/tools/web.ts";
 
 const ctx = { workspace: process.cwd(), signal: new AbortController().signal };
 
@@ -51,6 +51,9 @@ describe("web_fetch", () => {
       if (req.url === "/json") return res.writeHead(200, { "content-type": "application/json" }).end('{"a":1}');
       if (req.url === "/redirect") return res.writeHead(302, { location: "/page" }).end();
       if (req.url === "/bin") return res.writeHead(200, { "content-type": "image/png" }).end("PNG");
+      if (req.url === "/img.png") return res.writeHead(200, { "content-type": "image/png" }).end(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+      if (req.url === "/img.svg") return res.writeHead(200, { "content-type": "image/svg+xml" }).end("<svg onload=alert(1)/>");
+      if (req.url === "/huge.png") return res.writeHead(200, { "content-type": "image/png", "content-length": String(50_000_000) }).end();
       res.writeHead(404).end("nope");
     });
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
@@ -74,6 +77,24 @@ describe("web_fetch", () => {
       `http://0.0.0.0:${port}/page`,
       `http://localhost:${port}/page`,
     ]) await assert.rejects(webFetchTool.run({ url: u }, ctx), /private\/local address/, u);
+  });
+
+  it("fetchImage (UI image proxy): raster only, size-capped, same address guard", async () => {
+    const signal = new AbortController().signal;
+    delete process.env.AGENT_ALLOW_PRIVATE_FETCH;
+    await assert.rejects(fetchImage(`${base}/img.png`, signal), /private\/local address/);
+    process.env.AGENT_ALLOW_PRIVATE_FETCH = "1";
+    try {
+      const img = await fetchImage(`${base}/img.png`, signal);
+      assert.equal(img.type, "image/png");
+      assert.equal(img.body.length, 4);
+      await assert.rejects(fetchImage(`${base}/img.svg`, signal), /Not a supported image type: "image\/svg\+xml"/);
+      await assert.rejects(fetchImage(`${base}/page`, signal), /Not a supported image type/);
+      await assert.rejects(fetchImage(`${base}/huge.png`, signal), /too large/);
+      await assert.rejects(fetchImage("javascript:alert(1)", signal), /Only http/);
+    } finally {
+      delete process.env.AGENT_ALLOW_PRIVATE_FETCH;
+    }
   });
 
   it("fetches, follows redirects, converts, paginates and reports errors", async () => {

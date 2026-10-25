@@ -148,6 +148,44 @@ async function readBody(res: FetchResponse): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
+// Image proxy (used by the browser UI)
+// ---------------------------------------------------------------------------
+
+const MAX_IMAGE_BYTES = 15_000_000;
+// Raster formats only: SVG can carry script and would run in the UI's origin if opened directly.
+const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/bmp", "image/x-icon", "image/vnd.microsoft.icon"]);
+
+/**
+ * Fetches a remote image for the UI with the same guards as web_fetch (public addresses only,
+ * pinned DNS, checked redirects). Returns the bytes and content type, or throws ToolError.
+ */
+export async function fetchImage(rawUrl: string, signal: AbortSignal): Promise<{ type: string; body: Buffer }> {
+  const res = await safeFetch(rawUrl, { workspace: "", signal }, { headers: { Accept: "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8" } });
+  if (!res.ok) {
+    await res.body?.cancel();
+    throw new ToolError(`HTTP ${res.status} for image ${rawUrl}`);
+  }
+  const type = (res.headers.get("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
+  if (!IMAGE_TYPES.has(type)) {
+    await res.body?.cancel();
+    throw new ToolError(`Not a supported image type: "${type || "unknown"}"`);
+  }
+  const declared = Number(res.headers.get("content-length") ?? 0);
+  if (declared > MAX_IMAGE_BYTES) {
+    await res.body?.cancel();
+    throw new ToolError("Image too large");
+  }
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for await (const chunk of res.body ?? []) {
+    size += chunk.byteLength;
+    if (size > MAX_IMAGE_BYTES) throw new ToolError("Image too large");
+    chunks.push(chunk);
+  }
+  return { type, body: Buffer.concat(chunks) };
+}
+
+// ---------------------------------------------------------------------------
 // HTML -> Markdown
 // ---------------------------------------------------------------------------
 

@@ -10,7 +10,9 @@ import { Marked } from "marked";
 
 const page = readFileSync(new URL("../web/index.html", import.meta.url), "utf8");
 const script = page.split("<script>")[1]!.split("</script>")[0]!;
-const mathSetup = script.slice(script.indexOf("const escapeHtml"), script.indexOf("// While a message streams"));
+const [from, to] = [script.indexOf("// @math-start"), script.indexOf("// @math-end")];
+assert.ok(from >= 0 && to > from, "math block markers missing in web/index.html");
+const mathSetup = script.slice(from, to);
 const marked = new Marked();
 new Function("marked", "katex", mathSetup)(marked, katex);
 const render = (s: string) => marked.parse(s) as string;

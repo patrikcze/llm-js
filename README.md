@@ -110,7 +110,10 @@ Answers are rendered as Markdown with:
 
 - **Math**: KaTeX, for `$…$`, `\(…\)` (inline) and `$$…$$`, `\[…\]` (display, also mid-sentence). Math is tokenised before Markdown, so `\\`, `_` and `*` inside formulas survive. Currency like `$5 and $10` stays plain text.
 - **Diagrams**: ```` ```mermaid ```` blocks render as SVG in the HUD colours (flowcharts, sequence, pie, git, …), with a Source toggle. Mermaid loads only when the first diagram appears and runs in its `strict` security mode. Syntax errors show the message and the source.
-- **Images**: rendered once the answer has finished streaming. **⚙ Config → Display** sets remote images to *Auto-load* (default), *Click to load*, or *Off*. Loading an image contacts its server, so a page the agent read could try to leak data through an image URL. *Click to load* shows the host first.
+- **Images**: rendered once the answer has finished streaming. **⚙ Config → Display** sets remote images to *Auto-load* (default), *Click to load*, or *Off*. The setting can't be bypassed:
+  - The page's CSP allows only same-origin images, so the browser blocks every other way model output could load one: `srcset`, CSS `url()`, SVG `<image>`, video posters.
+  - Allowed images come through `/api/image`. This proxy uses `web_fetch`'s guards (public addresses only, pinned DNS, checked redirects), accepts raster formats only up to 15 MB, and requires a per-server token that only the page knows.
+  - The image host sees the server, not your browser. Fetching an image still sends its URL out, though, so a page the agent read could try to leak data through one. *Click to load* shows the host first.
 
 KaTeX and Mermaid are served from `node_modules`, so this works offline and in Docker.
 
