@@ -1,6 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { glob, readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
+import { SAFE_GIT_ARGS, safeGitEnv } from "./git.ts";
 import { isBinary, realInside, rel, resolveInWorkspace, SKIP_DIRS } from "./paths.ts";
 import { type Tool, type ToolContext, ToolError } from "./types.ts";
 
@@ -25,9 +26,13 @@ export function hasRipgrep(): Promise<boolean> {
 }
 
 /** Runs a program (no shell) with optional stdin; resolves with its exit code and output. */
-function runProgram(file: string, args: string[], opts: { cwd: string; input?: string; signal: AbortSignal; maxLines?: number }) {
+function runProgram(
+  file: string,
+  args: string[],
+  opts: { cwd: string; input?: string; signal: AbortSignal; maxLines?: number; env?: NodeJS.ProcessEnv },
+) {
   return new Promise<{ code: number | null; stdout: string; stderr: string; cut: boolean }>((resolve, reject) => {
-    const child = spawn(file, args, { cwd: opts.cwd, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+    const child = spawn(file, args, { cwd: opts.cwd, env: opts.env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
     let stdout = "";
     let stderr = "";
     let lines = 0;
@@ -69,7 +74,12 @@ function runProgram(file: string, args: string[], opts: { cwd: string; input?: s
 async function gitIgnored(root: string, paths: string[], signal: AbortSignal): Promise<Set<string>> {
   if (!paths.length) return new Set();
   try {
-    const r = await runProgram("git", ["-C", root, "check-ignore", "--stdin"], { cwd: root, input: paths.join("\n"), signal });
+    const r = await runProgram("git", [...SAFE_GIT_ARGS, "-C", root, "check-ignore", "--stdin"], {
+      cwd: root,
+      input: paths.join("\n"),
+      signal,
+      env: safeGitEnv(),
+    });
     return new Set(r.code === 0 ? r.stdout.split("\n").filter(Boolean) : []);
   } catch {
     return new Set();

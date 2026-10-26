@@ -1,13 +1,14 @@
 /** run_command (security and process handling) and local_context. */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { after, before, describe, it } from "node:test";
 import { approvalKey } from "../src/agent.ts";
 import { localContextTool } from "../src/tools/context.ts";
 import { fsTools } from "../src/tools/fs.ts";
+import { grepTool } from "../src/tools/search.ts";
 import { blockedReason, commandEnv, runCommandTool } from "../src/tools/shell.ts";
 import { assertValidTranscript, setup } from "./harness.ts";
 
@@ -234,8 +235,83 @@ describe("local_context", () => {
       assert.ok(out.includes(`Local: ${new Date().getFullYear()}-`), "local year");
       assert.match(out, /Memory: [\d.]+ GB available of [\d.]+ GB/);
       assert.match(out, /Commands on PATH: .*\bgit\b/);
-      assert.match(out, /Git: branch trunk · [0-9a-f]{7,} first commit .* · clean/);
+      assert.match(out, /Git: branch trunk · [0-9a-f]{7,} first commit \(.*\) · local changes: run `git status` with run_command/);
       assert.match(out, /package\.json: demo@1\.2\.3 · scripts: test, build/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("untrusted repositories", { skip: process.platform === "win32" && "POSIX shell in git config" }, () => {
+  it("read-only tools never let a repository's git config launch programs", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "agent-hostile-"));
+    try {
+      const git = (...args: string[]) =>
+        execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", ...args], { stdio: "pipe" });
+      git("init", "-q");
+      await writeFile(path.join(dir, "a.txt"), "alpha\n");
+      git("add", ".");
+      git("commit", "-q", "-m", "init");
+      await writeFile(path.join(dir, "a.txt"), "alpha changed\n");
+      await writeFile(path.join(dir, ".gitattributes"), "* filter=evil diff=evil\n");
+      const mark = (name: string) => `sh -c 'touch "${dir}/PWNED_${name}"; cat'`;
+      git("config", "core.fsmonitor", `touch "${dir}/PWNED_FSMONITOR"; false`);
+      git("config", "filter.evil.clean", mark("CLEAN"));
+      git("config", "filter.evil.smudge", mark("SMUDGE"));
+      git("config", "diff.evil.textconv", mark("TEXTCONV"));
+      git("config", "log.showSignature", "true");
+      git("config", "gpg.program", mark("GPG"));
+      git("config", "core.pager", mark("PAGER"));
+      await mkdir(path.join(dir, ".git", "hooks"), { recursive: true });
+      await writeFile(path.join(dir, ".git", "hooks", "post-index-change"), `#!/bin/sh\ntouch "${dir}/PWNED_HOOK"\n`, { mode: 0o755 });
+
+      const ctx = { workspace: dir, signal: new AbortController().signal };
+      const out = await localContextTool.run({}, ctx);
+      assert.match(out, /Git: branch \S+ · [0-9a-f]{7,} init/);
+      await grepTool.run({ pattern: "alpha" }, ctx);
+      process.env.AGENT_NO_RIPGREP = "1"; // the built-in search asks git which files are ignored
+      try {
+        await grepTool.run({ pattern: "alpha" }, ctx);
+      } finally {
+        delete process.env.AGENT_NO_RIPGREP;
+      }
+      const pwned = (await readdir(dir)).filter((f) => f.startsWith("PWNED_"));
+      assert.deepEqual(pwned, [], `repository config launched: ${pwned.join(", ")}`);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("file tools refuse to modify .git (config, hooks, nested repos, via symlinks)", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "agent-gitdir-"));
+    try {
+      execFileSync("git", ["init", "-q", dir]);
+      await mkdir(path.join(dir, "sub", ".git"), { recursive: true });
+      await writeFile(path.join(dir, "a.txt"), "x");
+      await symlink(path.join(dir, ".git", "config"), path.join(dir, "cfg"));
+      const ctx = { workspace: dir, signal: new AbortController().signal };
+      const tool = (name: string) => fsTools.find((t) => t.name === name)!;
+      const attempts: [string, Record<string, unknown>][] = [
+        ["write_file", { path: ".git/config", content: "[core]\n\tfsmonitor = evil\n" }],
+        ["write_file", { path: ".git/hooks/pre-commit", content: "#!/bin/sh\nevil\n" }],
+        ["write_file", { path: "sub/.git/config", content: "x" }],
+        ["write_file", { path: "cfg", content: "x" }],
+        ["write_file", { path: ".GIT/config", content: "x" }],
+        ["edit_file", { path: ".git/config", old_text: "[core]", new_text: "[core]\n\tfsmonitor = evil" }],
+        ["make_dir", { path: ".git/hooks/evil" }],
+        ["move_path", { from: "a.txt", to: ".git/hooks/post-checkout" }],
+        ["move_path", { from: ".git", to: "stolen-git" }],
+        ["delete_path", { path: ".git" }],
+      ];
+      for (const [name, args] of attempts) {
+        const t = tool(name);
+        await assert.rejects(t.describe!(args, ctx), /repository internals/, `${name} ${JSON.stringify(args)} (describe)`);
+        await assert.rejects(t.run(args, ctx), /repository internals/, `${name} ${JSON.stringify(args)} (run)`);
+      }
+      // Ordinary files whose names merely contain "git" are fine.
+      await tool("write_file").run({ path: ".gitignore", content: "*.log\n" }, ctx);
+      await tool("write_file").run({ path: "docs/git-notes.md", content: "ok" }, ctx);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

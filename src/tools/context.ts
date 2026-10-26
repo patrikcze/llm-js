@@ -4,14 +4,15 @@ import { access, readdir, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { SAFE_GIT_ARGS, safeGitEnv } from "./git.ts";
 import { type Tool, ToolError } from "./types.ts";
 
 const run = promisify(execFile);
 
 /** Runs a program without a shell; returns trimmed stdout, or "" on any failure. */
-async function quiet(file: string, args: string[], cwd?: string): Promise<string> {
+async function quiet(file: string, args: string[], cwd?: string, env?: NodeJS.ProcessEnv): Promise<string> {
   try {
-    const { stdout } = await run(file, args, { cwd, timeout: 3000, maxBuffer: 1_000_000, windowsHide: true });
+    const { stdout } = await run(file, args, { cwd, env, timeout: 3000, maxBuffer: 1_000_000, windowsHide: true });
     return stdout.trim();
   } catch {
     return "";
@@ -130,18 +131,20 @@ async function workspaceInfo(dir: string): Promise<string[]> {
   const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
   lines.push(`Top level: ${entries.filter((e) => e.isDirectory()).length} directories, ${entries.filter((e) => e.isFile()).length} files`);
 
-  const inGit = (await quiet("git", ["-C", dir, "rev-parse", "--is-inside-work-tree"])) === "true";
+  // Only git subcommands that never refresh the index (no `status`: it runs core.fsmonitor and
+  // filter programs from the repository's config), with program-launching settings overridden.
+  const git = (...args: string[]) => quiet("git", [...SAFE_GIT_ARGS, "-C", dir, ...args], undefined, safeGitEnv());
+  const inGit = (await git("rev-parse", "--is-inside-work-tree")) === "true";
   if (inGit) {
-    const [branch, last, status, remote] = await Promise.all([
-      quiet("git", ["-C", dir, "branch", "--show-current"]),
-      quiet("git", ["-C", dir, "log", "-1", "--format=%h %s (%cr)"]),
-      quiet("git", ["-C", dir, "status", "--porcelain"]),
-      quiet("git", ["-C", dir, "remote", "get-url", "origin"]),
+    const [branch, last, remote] = await Promise.all([
+      git("branch", "--show-current"),
+      git("log", "-1", "--no-show-signature", "--format=%h %s (%cr)"),
+      git("remote", "get-url", "origin"),
     ]);
-    const changed = status ? status.split("\n").length : 0;
     lines.push(
-      `Git: branch ${branch || "(detached)"} · ${last || "no commits yet"} · ${changed ? `${changed} changed file(s)` : "clean"}` +
-        (remote ? ` · origin ${remote.replace(/\/\/[^@/]+@/, "//")}` : ""),
+      `Git: branch ${branch || "(detached)"} · ${last || "no commits yet"}` +
+        (remote ? ` · origin ${remote.replace(/\/\/[^@/]+@/, "//")}` : "") +
+        " · local changes: run `git status` with run_command",
     );
   } else {
     lines.push("Git: not a repository");

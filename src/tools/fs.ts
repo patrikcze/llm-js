@@ -1,6 +1,7 @@
-import { constants, type Dirent } from "node:fs";
+import { constants, type Dirent, realpathSync } from "node:fs";
 import { type FileHandle, mkdir, open, readdir, readFile, realpath, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
+import { insideGitDir } from "./git.ts";
 import { isBinary, realInside, rel, resolveInWorkspace, SKIP_DIRS } from "./paths.ts";
 import { globTool, grepTool } from "./search.ts";
 import { type ImageData, type Tool, type ToolContext, ToolError, type ToolOutput, truncate } from "./types.ts";
@@ -118,6 +119,19 @@ async function exists(p: string): Promise<boolean> {
   );
 }
 
+/**
+ * resolveInWorkspace for paths a tool will change. Repository internals (.git) are off limits:
+ * a written .git/config or hook would make git run programs later, outside the approval gate.
+ * Git operations go through run_command, which asks the user.
+ */
+async function resolveWritable(ctx: ToolContext, p: string): Promise<string> {
+  const real = await resolveInWorkspace(ctx, p);
+  if (insideGitDir(path.relative(realpathSync(ctx.workspace), real))) {
+    throw new ToolError(`Refusing to modify repository internals (${p}). Use git through run_command instead.`);
+  }
+  return real;
+}
+
 export const writeFileTool: Tool<{ path: string; content: string }> = {
   name: "write_file",
   description:
@@ -133,7 +147,7 @@ export const writeFileTool: Tool<{ path: string; content: string }> = {
     required: ["path", "content"],
   },
   async describe({ path: p, content }, ctx) {
-    const file = await resolveInWorkspace(ctx, p);
+    const file = await resolveWritable(ctx, p);
     const st = await stat(file).catch(() => null);
     if (st?.isDirectory()) throw new ToolError(`${p} is a directory.`);
     return {
@@ -142,7 +156,7 @@ export const writeFileTool: Tool<{ path: string; content: string }> = {
     };
   },
   async run({ path: p, content }, ctx) {
-    const file = await resolveInWorkspace(ctx, p);
+    const file = await resolveWritable(ctx, p);
     const existed = await exists(file);
     await mkdir(path.dirname(file), { recursive: true });
     await writeInWorkspace(ctx, p, file, content);
@@ -156,7 +170,7 @@ type EditArgs = { path: string; old_text: string; new_text: string; replace_all?
 async function planEdit({ path: p, old_text, new_text, replace_all = false }: EditArgs, ctx: ToolContext) {
   if (!old_text) throw new ToolError("old_text must not be empty. To create a file use write_file.");
   if (old_text === new_text) throw new ToolError("old_text and new_text are identical; nothing to change.");
-  const file = await resolveInWorkspace(ctx, p);
+  const file = await resolveWritable(ctx, p);
   let text: string;
   try {
     text = await readFile(file, "utf8");
@@ -209,10 +223,10 @@ export const makeDirTool: Tool<{ path: string }> = {
   risk: "write",
   parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
   async describe({ path: p }, ctx) {
-    return { summary: `Create directory ${rel(ctx, await resolveInWorkspace(ctx, p))}` };
+    return { summary: `Create directory ${rel(ctx, await resolveWritable(ctx, p))}` };
   },
   async run({ path: p }, ctx) {
-    const dir = await resolveInWorkspace(ctx, p);
+    const dir = await resolveWritable(ctx, p);
     await mkdir(dir, { recursive: true });
     return `Directory ready: ${rel(ctx, dir)}`;
   },
@@ -228,15 +242,15 @@ export const movePathTool: Tool<{ from: string; to: string }> = {
     required: ["from", "to"],
   },
   async describe({ from, to }, ctx) {
-    const src = await resolveInWorkspace(ctx, from);
-    const dst = await resolveInWorkspace(ctx, to);
+    const src = await resolveWritable(ctx, from);
+    const dst = await resolveWritable(ctx, to);
     if (!(await exists(src))) throw new ToolError(`Not found: ${from}`);
     if (await exists(dst)) throw new ToolError(`Destination already exists: ${to}`);
     return { summary: `Move ${rel(ctx, src)} -> ${rel(ctx, dst)}` };
   },
   async run({ from, to }, ctx) {
-    const src = await resolveInWorkspace(ctx, from);
-    const dst = await resolveInWorkspace(ctx, to);
+    const src = await resolveWritable(ctx, from);
+    const dst = await resolveWritable(ctx, to);
     if (await exists(dst)) throw new ToolError(`Destination already exists: ${to}`);
     await mkdir(path.dirname(dst), { recursive: true });
     await rename(src, dst);
@@ -250,14 +264,14 @@ export const deletePathTool: Tool<{ path: string }> = {
   risk: "destructive",
   parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
   async describe({ path: p }, ctx) {
-    const target = await resolveInWorkspace(ctx, p);
+    const target = await resolveWritable(ctx, p);
     if (target === (await realpath(ctx.workspace))) throw new ToolError("Refusing to delete the workspace root.");
     const st = await stat(target).catch(() => null);
     if (!st) throw new ToolError(`Not found: ${p}`);
     return { summary: `Delete ${st.isDirectory() ? "directory (recursively)" : "file"} ${rel(ctx, target)}` };
   },
   async run({ path: p }, ctx) {
-    const target = await resolveInWorkspace(ctx, p);
+    const target = await resolveWritable(ctx, p);
     if (target === (await realpath(ctx.workspace))) throw new ToolError("Refusing to delete the workspace root.");
     await rm(target, { recursive: true });
     return `Deleted ${rel(ctx, target)}`;
