@@ -4,6 +4,8 @@ An agent loop in TypeScript with filesystem tools, web search and web fetch. It 
 
 Node runs the TypeScript directly (≥ 22.18, no build step), or you can run the whole stack in Docker.
 
+![llm-agent](./images/llm-agent.jpg)
+
 ## Quick start
 
 **Docker (everything included):**
