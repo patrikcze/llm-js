@@ -3,11 +3,12 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { styleText } from "node:util";
-import { Agent, type ApprovalRequest, type PermissionMode, type RunResult, type UserInput } from "./agent.ts";
+import { Agent, type ApprovalRequest, approvalKey, type PermissionMode, type RunResult, type UserInput } from "./agent.ts";
 import { COMMON_HELP, COMMON_OPTIONS, ConfigError, MODES, parseArgs, resolveConfig, THINKING } from "./config.ts";
 import type { ThinkingMode } from "./providers.ts";
-import { fsTools, sniffImage } from "./tools/fs.ts";
-import { searchProviderName, webTools } from "./tools/web.ts";
+import { defaultTools } from "./tools/all.ts";
+import { sniffImage } from "./tools/fs.ts";
+import { searchProviderName } from "./tools/web.ts";
 
 const HELP = `llm-agent: an agent with filesystem, web search and web fetch tools for any OpenAI-compatible server.
 
@@ -74,7 +75,7 @@ process.on("SIGINT", () => current?.abort()); // non-TTY
 const alwaysAllow = new Set<string>();
 
 async function approve(req: ApprovalRequest): Promise<boolean> {
-  if (alwaysAllow.has(req.tool)) return true;
+  if (alwaysAllow.has(approvalKey(req))) return true;
   if (!process.stdin.isTTY && !interactive) {
     err(`Denied ${req.action.summary}: no terminal to ask. Use --mode auto-edit or --yes.`);
     return false;
@@ -90,11 +91,16 @@ async function approve(req: ApprovalRequest): Promise<boolean> {
     process.stdout.write(`${shown + (lines.length > 40 ? dim(`\n  │ ... ${lines.length - 40} more lines`) : "")}\n`);
   }
   try {
-    const answer = (await rl.question(styleText(color, "  Allow? [y]es / [n]o / [a]lways for this tool: "), { signal: current?.signal }))
+    const answer = (
+      await rl.question(
+        styleText(color, `  Allow? [y]es / [n]o / [a]lways ${req.tool === "run_command" ? "for this exact command" : "for this tool"}: `),
+        { signal: current?.signal },
+      )
+    )
       .trim()
       .toLowerCase();
     if (answer === "a" || answer === "always") {
-      alwaysAllow.add(req.tool);
+      alwaysAllow.add(approvalKey(req));
       return true;
     }
     return answer === "y" || answer === "yes";
@@ -114,7 +120,7 @@ const agent = new Agent({
   client: chat,
   model,
   workspace,
-  tools: [...fsTools, ...webTools],
+  tools: defaultTools({ exec: !opt["no-exec"] }),
   permissions: { mode },
   approve,
   instructions,

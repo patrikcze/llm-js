@@ -29,6 +29,7 @@ export const COMMON_OPTIONS = {
   temperature: { type: "string", short: "t" },
   think: { type: "string" },
   "no-stream": { type: "boolean" },
+  "no-exec": { type: "boolean" },
   help: { type: "boolean", short: "h" },
 } as const satisfies ParseArgsConfig["options"];
 
@@ -44,6 +45,7 @@ export const COMMON_HELP = `  -m, --model <id>         model id (default: saved 
   -t, --temperature <x>    sampling temperature (ignored by Anthropic, which no longer accepts it)
       --think <mode>       auto | on | off   reasoning switch (default: auto = the model decides)
       --no-stream          wait for whole replies instead of streaming tokens
+      --no-exec            do not give the agent the run_command tool
   -h, --help
 
 Provider and model chosen in the browser UI are saved to ~/.llm-agent/settings.json

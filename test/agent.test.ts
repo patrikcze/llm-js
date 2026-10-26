@@ -367,7 +367,7 @@ describe("permission policy", () => {
       assert.equal(t.agent.messages[0]!.content, systemBefore);
       assert.match(
         String(t.llm.requests[1]!.messages.at(-1)!.content),
-        /^\[Permission mode changed to "auto-edit": Writes run immediately/,
+        /^\[Permission mode changed to "auto-edit": File writes run immediately/,
       );
       assertValidTranscript(t.agent.messages);
     } finally {
@@ -405,7 +405,7 @@ describe("workspace sandbox", () => {
 describe("symlink escapes", () => {
   const ctxFor = (workspace: string) => ({ workspace, signal: new AbortController().signal });
 
-  it("search_files and find_files never read or list through links that leave the workspace", async () => {
+  it("grep and glob never read or list through links that leave the workspace", async () => {
     const t = await setup();
     const outside = await mkdtemp(path.join(os.tmpdir(), "agent-outside-"));
     try {
@@ -415,12 +415,18 @@ describe("symlink escapes", () => {
       await symlink(path.join(outside, "secret.txt"), path.join(t.workspace, "link.txt"));
       await symlink(path.join(outside, "dir"), path.join(t.workspace, "linkdir"));
       await writeFile(path.join(t.workspace, "ok.txt"), "TOP_SECRET_TOKEN is mentioned here\n");
-      const search = fsTools.find((x) => x.name === "search_files")!;
-      const find = fsTools.find((x) => x.name === "find_files")!;
-      const hits = await search.run({ query: "TOP_SECRET_TOKEN" }, ctxFor(t.workspace));
-      assert.equal(hits, "ok.txt:1: TOP_SECRET_TOKEN is mentioned here");
-      const files = await find.run({ pattern: "**/*.txt" }, ctxFor(t.workspace));
-      assert.equal(files, "ok.txt");
+      const grep = fsTools.find((x) => x.name === "grep")!;
+      const glob = fsTools.find((x) => x.name === "glob")!;
+      for (const backend of ["ripgrep", "builtin"]) {
+        if (backend === "builtin") process.env.AGENT_NO_RIPGREP = "1";
+        try {
+          const hits = await grep.run({ pattern: "TOP_SECRET_TOKEN" }, ctxFor(t.workspace));
+          assert.equal(hits, "ok.txt:1:TOP_SECRET_TOKEN is mentioned here", backend);
+          assert.equal(await glob.run({ pattern: "*.txt" }, ctxFor(t.workspace)), "ok.txt", backend);
+        } finally {
+          delete process.env.AGENT_NO_RIPGREP;
+        }
+      }
     } finally {
       await rm(outside, { recursive: true, force: true });
       await t.cleanup();
@@ -484,7 +490,7 @@ describe("filesystem tools", () => {
     }
   });
 
-  it("find_files and search_files locate files and lines", async () => {
+  it("glob and grep locate files and lines, skipping node_modules", async () => {
     const t = await setup();
     try {
       await mkdir(path.join(t.workspace, "src/deep"), { recursive: true });
@@ -494,14 +500,14 @@ describe("filesystem tools", () => {
       t.llm.enqueue(
         {
           tool_calls: [
-            { name: "find_files", args: { pattern: "**/*.ts" } },
-            { name: "search_files", args: { query: "todo_me" } },
+            { name: "glob", args: { pattern: "*.ts" } },
+            { name: "grep", args: { pattern: "todo_me", case_insensitive: true } },
           ],
         },
         (req) => {
           const [found, grep] = toolResults(req);
           assert.equal(found, "src/deep/x.ts");
-          assert.equal(grep, "src/deep/x.ts:1: export const TODO_ME = 1;");
+          assert.equal(grep, "src/deep/x.ts:1:export const TODO_ME = 1;");
           return { content: "ok" };
         },
       );

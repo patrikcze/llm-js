@@ -17,7 +17,12 @@ import type { ChatCompletionFunctionTool } from "openai/resources/chat/completio
 // ===========================================================================
 
 /** How dangerous a tool is. Drives the permission policy. */
-export type ToolRisk = "read" | "write" | "destructive";
+/**
+ * How dangerous a tool is. Drives the permission policy:
+ *   read: runs freely · write: changes files in the workspace · destructive: deletes ·
+ *   execute: runs arbitrary programs (asked in every mode except "auto").
+ */
+export type ToolRisk = "read" | "write" | "destructive" | "execute";
 
 export interface ToolContext {
   /** Absolute path the filesystem tools are confined to. */
@@ -93,7 +98,7 @@ export function assertValidTool(tool: Tool): void {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(tool.name)) throw new Error(`Tool name "${tool.name}" must be snake_case`);
   if (!tool.description?.trim()) throw new Error(`Tool ${tool.name} needs a description`);
   if (tool.parameters?.type !== "object") throw new Error(`Tool ${tool.name}: parameters must be an object schema`);
-  if (!["read", "write", "destructive"].includes(tool.risk)) throw new Error(`Tool ${tool.name}: invalid risk "${tool.risk}"`);
+  if (!["read", "write", "destructive", "execute"].includes(tool.risk)) throw new Error(`Tool ${tool.name}: invalid risk "${tool.risk}"`);
   if (typeof tool.run !== "function") throw new Error(`Tool ${tool.name}: run must be a function`);
   if (tool.risk !== "read" && typeof tool.describe !== "function") {
     throw new Error(`Tool ${tool.name}: risk "${tool.risk}" requires describe()`);

@@ -1,53 +1,14 @@
-import { constants, type Dirent, realpathSync } from "node:fs";
-import { type FileHandle, glob, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, stat } from "node:fs/promises";
+import { constants, type Dirent } from "node:fs";
+import { type FileHandle, mkdir, open, readdir, readFile, realpath, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
+import { isBinary, realInside, rel, resolveInWorkspace, SKIP_DIRS } from "./paths.ts";
+import { globTool, grepTool } from "./search.ts";
 import { type ImageData, type Tool, type ToolContext, ToolError, type ToolOutput, truncate } from "./types.ts";
+
+export { isBinary, realInside, rel, resolveInWorkspace, SKIP_DIRS };
 
 const MAX_READ_CHARS = 60_000;
 const MAX_LIST_ENTRIES = 500;
-const MAX_GREP_MATCHES = 200;
-const SKIP_DIRS = new Set([".git", "node_modules", ".next", "dist", "build", ".venv", "__pycache__"]);
-
-/**
- * Resolves a user/model supplied path inside the workspace and refuses anything that
- * escapes it, including escapes through symlinks.
- */
-export async function resolveInWorkspace(ctx: ToolContext, p: string): Promise<string> {
-  if (typeof p !== "string" || p.trim() === "") throw new ToolError("path must be a non-empty string");
-  const abs = path.resolve(ctx.workspace, p);
-  const root = await realpath(ctx.workspace);
-  // Resolve symlinks on the deepest part of the path that already exists.
-  let existing = abs;
-  const tail: string[] = [];
-  while (true) {
-    try {
-      existing = await realpath(existing);
-      break;
-    } catch {
-      // realpath fails on a missing path, but also on a symlink whose target is missing.
-      // Following such a link on write would create a file wherever it points: refuse it.
-      if ((await lstat(existing).catch(() => null))?.isSymbolicLink()) {
-        throw new ToolError(`Path "${p}" goes through a broken symlink (${existing}); refusing to follow it.`);
-      }
-      const parent = path.dirname(existing);
-      if (parent === existing) break;
-      tail.unshift(path.basename(existing));
-      existing = parent;
-    }
-  }
-  const real = path.join(existing, ...tail);
-  if (real !== root && !real.startsWith(root + path.sep)) {
-    throw new ToolError(`Path "${p}" is outside the workspace (${ctx.workspace}). Use paths relative to the workspace.`);
-  }
-  return real;
-}
-
-/** Real path of `full` if it stays inside `root` (a realpath'd workspace), else null. */
-async function realInside(root: string, full: string): Promise<string | null> {
-  const real = await realpath(full).catch(() => null);
-  return real && (real === root || real.startsWith(root + path.sep)) ? real : null;
-}
-
 /**
  * Writes `data` to an already-validated path without following a symlink at the last component,
  * after re-checking that the parent directory still resolves to the same place. This closes the
@@ -67,15 +28,6 @@ async function writeInWorkspace(ctx: ToolContext, p: string, file: string, data:
   } finally {
     await fh.close();
   }
-}
-
-function rel(ctx: ToolContext, abs: string): string {
-  return path.relative(realpathSync(ctx.workspace), abs) || ".";
-}
-
-async function isBinary(buf: Buffer): Promise<boolean> {
-  const sample = buf.subarray(0, 8000);
-  return sample.includes(0);
 }
 
 function numberLines(text: string, startLine: number): string {
@@ -312,83 +264,6 @@ export const deletePathTool: Tool<{ path: string }> = {
   },
 };
 
-export const findFilesTool: Tool<{ pattern: string; path?: string }> = {
-  name: "find_files",
-  risk: "read",
-  description: "Find files by glob pattern, e.g. '**/*.ts' or 'src/**/test_*.py'. Returns matching paths.",
-  parameters: {
-    type: "object",
-    properties: {
-      pattern: { type: "string", description: "Glob pattern." },
-      path: { type: "string", description: "Directory to search from. Default '.'" },
-    },
-    required: ["pattern"],
-  },
-  async run({ pattern, path: p = "." }, ctx) {
-    const base = await resolveInWorkspace(ctx, p);
-    const root = await realpath(ctx.workspace);
-    const out: string[] = [];
-    for await (const m of glob(pattern, {
-      cwd: base,
-      exclude: (f: string) => SKIP_DIRS.has(path.basename(f)),
-    })) {
-      // Skip matches that only exist through a symlink pointing outside the workspace.
-      if (!(await realInside(root, path.join(base, m)))) continue;
-      out.push(rel(ctx, path.join(base, m)));
-      if (out.length >= MAX_LIST_ENTRIES) break;
-    }
-    if (out.length === 0) return `No files match ${pattern}`;
-    return out.sort().join("\n") + (out.length >= MAX_LIST_ENTRIES ? `\n[stopped at ${MAX_LIST_ENTRIES}]` : "");
-  },
-};
-
-export const searchFilesTool: Tool<{ query: string; path?: string; regex?: boolean; case_sensitive?: boolean; include?: string }> = {
-  name: "search_files",
-  risk: "read",
-  description:
-    "Search file contents (like grep). Returns 'path:line: text' for each match. " + "Use include to limit to a glob such as '**/*.ts'.",
-  parameters: {
-    type: "object",
-    properties: {
-      query: { type: "string", description: "Text or regular expression to search for." },
-      path: { type: "string", description: "Directory to search. Default '.'" },
-      regex: { type: "boolean", description: "Treat query as a JavaScript regular expression. Default false." },
-      case_sensitive: { type: "boolean", description: "Default false." },
-      include: { type: "string", description: "Glob of files to search. Default '**/*'." },
-    },
-    required: ["query"],
-  },
-  async run({ query, path: p = ".", regex = false, case_sensitive = false, include = "**/*" }, ctx) {
-    const base = await resolveInWorkspace(ctx, p);
-    let re: RegExp;
-    try {
-      const src = regex ? query : query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      re = new RegExp(src, case_sensitive ? "" : "i");
-    } catch (e: any) {
-      throw new ToolError(`Invalid regex: ${e.message}`);
-    }
-    const root = await realpath(ctx.workspace);
-    const out: string[] = [];
-    for await (const m of glob(include, { cwd: base, exclude: (f: string) => SKIP_DIRS.has(path.basename(f)) })) {
-      if (ctx.signal.aborted || out.length >= MAX_GREP_MATCHES) break;
-      // Read through the real path, and never outside the workspace (symlinked files or dirs).
-      const shown = path.join(base, m);
-      const full = await realInside(root, shown);
-      if (!full) continue;
-      const st = await stat(full).catch(() => null);
-      if (!st?.isFile() || st.size > 2_000_000) continue;
-      const buf = await readFile(full).catch(() => null);
-      if (!buf || (await isBinary(buf))) continue;
-      const lines = buf.toString("utf8").split("\n");
-      for (let i = 0; i < lines.length && out.length < MAX_GREP_MATCHES; i++) {
-        if (re.test(lines[i]!)) out.push(`${rel(ctx, shown)}:${i + 1}: ${lines[i]!.trim().slice(0, 300)}`);
-      }
-    }
-    if (out.length === 0) return `No matches for ${JSON.stringify(query)}.`;
-    return out.join("\n") + (out.length >= MAX_GREP_MATCHES ? `\n[stopped at ${MAX_GREP_MATCHES} matches; narrow the search]` : "");
-  },
-};
-
 const MAX_IMAGE_BYTES = 5_000_000; // the common provider limit per image
 
 /** Identifies an image by its first bytes rather than its file name. */
@@ -430,8 +305,8 @@ export const fsTools: Tool[] = [
   listDir,
   readFileTool,
   viewImageTool,
-  findFilesTool,
-  searchFilesTool,
+  globTool,
+  grepTool,
   writeFileTool,
   editFileTool,
   makeDirTool,

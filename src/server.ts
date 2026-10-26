@@ -14,13 +14,13 @@ import { readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Agent, type ApprovalRequest, type PermissionMode, type UserInput } from "./agent.ts";
+import { Agent, type ApprovalRequest, approvalKey, type PermissionMode, type UserInput } from "./agent.ts";
 import { COMMON_HELP, COMMON_OPTIONS, ConfigError, MODES, parseArgs, resolveConfig, THINKING } from "./config.ts";
 import { createChatClient, PROVIDERS, ProviderError, type ProviderKind } from "./providers.ts";
 import { loadSettings, publicProviders, type SavedSettings, saveSettings, settingsPath } from "./settings.ts";
-import { fsTools } from "./tools/fs.ts";
+import { defaultTools } from "./tools/all.ts";
 import { ToolError } from "./tools/types.ts";
-import { fetchImage, searchProviderName, webTools } from "./tools/web.ts";
+import { fetchImage, searchProviderName } from "./tools/web.ts";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -65,16 +65,19 @@ const imageToken = randomUUID();
 type Send = (event: string, data: unknown) => void;
 let send: Send | null = null;
 let running: AbortController | null = null;
-const pendingApprovals = new Map<string, { tool: string; resolve: (ok: boolean) => void }>();
+const pendingApprovals = new Map<string, { key: string; resolve: (ok: boolean) => void }>();
 const alwaysAllow = new Set<string>();
 
 async function approve(req: ApprovalRequest): Promise<boolean> {
-  if (alwaysAllow.has(req.tool)) return true;
+  const key = approvalKey(req);
+  if (alwaysAllow.has(key)) return true;
   if (!send) return false;
   const id = randomUUID();
-  send("approval", { id, tool: req.tool, risk: req.risk, summary: req.action.summary, preview: req.action.preview ?? "" });
+  // "Always" covers the whole tool, except for commands: those are approved one exact command line at a time.
+  const alwaysScope = req.tool === "run_command" ? "command" : "tool";
+  send("approval", { id, tool: req.tool, risk: req.risk, summary: req.action.summary, preview: req.action.preview ?? "", alwaysScope });
   return new Promise<boolean>((resolve) => {
-    pendingApprovals.set(id, { tool: req.tool, resolve });
+    pendingApprovals.set(id, { key, resolve });
     running?.signal.addEventListener("abort", () => resolve(false), { once: true });
   });
 }
@@ -83,7 +86,7 @@ const agent = new Agent({
   client: cfg.chat,
   model: cfg.model,
   workspace: cfg.workspace,
-  tools: [...fsTools, ...webTools],
+  tools: defaultTools({ exec: !opt["no-exec"] }),
   permissions: { mode: cfg.mode },
   approve,
   instructions: cfg.instructions,
@@ -305,7 +308,7 @@ const server = createServer(async (req, res) => {
       const pending = pendingApprovals.get(id);
       if (!pending) return json(res, 404, { error: "no such approval" });
       pendingApprovals.delete(id);
-      if (allow && always) alwaysAllow.add(pending.tool);
+      if (allow && always) alwaysAllow.add(pending.key);
       pending.resolve(Boolean(allow));
       return json(res, 200, { ok: true });
     }

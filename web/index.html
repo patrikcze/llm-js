@@ -131,6 +131,7 @@
   .tools-list span { border: 1px solid var(--line); padding: 1px 5px; font-size: 9.5px; color: var(--dim); }
   .tools-list span.write { color: var(--warn); border-color: rgba(233,196,106,.35); }
   .tools-list span.destructive { color: var(--err); border-color: rgba(255,122,107,.35); }
+  .tools-list span.execute { color: #ff9f5a; border-color: rgba(255,159,90,.4); }
   .vlabel {
     position: absolute; left: 10px; bottom: 30px; transform-origin: left bottom; transform: rotate(-90deg) translateY(100%);
     font-size: 9.5px; letter-spacing: .26em; color: var(--faint); white-space: nowrap;
@@ -934,17 +935,20 @@ async function run(message_, images = []) {
     },
     approval(a) {
       endText();
-      const box = add(el("div", "approval" + (a.risk === "destructive" ? " destructive" : "")));
-      box.append(el("div", "label", a.risk === "destructive" ? "⚠ Authorization required · destructive" : "Authorization required"), el("div", "q", a.summary));
+      const danger = a.risk === "destructive" || a.risk === "execute";
+      const box = add(el("div", "approval" + (danger ? " destructive" : "")));
+      const what = { destructive: "⚠ Authorization required · destructive", execute: "⚠ Authorization required · runs a command" }[a.risk] ?? "Authorization required";
+      box.append(el("div", "label", what), el("div", "q", a.summary));
       if (a.preview) box.append(el("pre", "", a.preview));
       const row = el("div", "buttons");
       const decide = async (allow, always) => {
-        row.replaceWith(el("div", "decided", allow ? (always ? `Authorized · always for ${a.tool}` : "Authorized") : "Denied"));
+        row.replaceWith(el("div", "decided", allow ? (always ? `Authorized · always for ${a.alwaysScope === "command" ? "this exact command" : a.tool}` : "Authorized") : "Denied"));
         status(allow ? "Executing " + a.tool : "Action denied");
         await api("/api/approve", { id: a.id, allow, always });
       };
       const yes = el("button", "solid", "Authorize"); yes.onclick = () => decide(true, false);
-      const always = el("button", "", "Always · " + a.tool); always.onclick = () => decide(true, true);
+      const always = el("button", "", a.alwaysScope === "command" ? "Always · this exact command" : "Always · " + a.tool);
+      always.onclick = () => decide(true, true);
       const no = el("button", "danger", "Deny"); no.onclick = () => decide(false, false);
       row.append(yes, always, no); box.append(row); yes.focus({ preventScroll: true });
       status("Awaiting authorization");
