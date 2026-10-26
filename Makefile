@@ -67,7 +67,7 @@ port_free = { $(NODE) -e "const s=require('net').createServer().once('error',()=
         start stop restart status logs open dev cli run \
         check ci lint fix format format-check typecheck test test-watch coverage audit \
         docker-build docker-up docker-down docker-restart docker-logs docker-ps docker-shell search-up search-down \
-        agent-up agent-down agent-cleanup agent-open agents agent-logs agent-shell docker-open \
+        agent-up agent-down agent-cleanup agent-open agents agent-logs agent-shell docker-open searxng-attach \
         clean distclean
 
 ##@ General
@@ -204,6 +204,7 @@ else
 	  echo "docker-up uses AGENT_PORT, not PORT (PORT is for make start). Try: make docker-up AGENT_PORT=$(PORT)" >&2; exit 2; fi
 	@mkdir -p $(RUN_DIR); [ -s $(RUN_DIR)/docker.token ] || (umask 077; $(gen_token) > $(RUN_DIR)/docker.token)
 	@AGENT_PORT=$(or $(AGENT_PORT),8787) AGENT_TOKEN=$$(cat $(RUN_DIR)/docker.token) TZ=$(TZ) $(COMPOSE) up -d --build
+	@$(MAKE) --no-print-directory searxng-attach
 	@echo "Open: http://127.0.0.1:$(or $(AGENT_PORT),8787)/?token=$$(cat $(RUN_DIR)/docker.token)"
 endif
 
@@ -226,6 +227,14 @@ docker-shell: ## Shell inside the agent container
 
 search-up: ## Start only SearXNG (for running the agent with Node)
 	$(COMPOSE) up -d searxng
+	@$(MAKE) --no-print-directory searxng-attach
+
+# A recreated SearXNG container is attached only to its own network; reconnect it to every isolated
+# agent's network so running agents keep their web search.
+searxng-attach:
+	@for net in $$($(DOCKER) network ls --filter label=llm-agent.name --format '{{.Name}}'); do \
+	  $(DOCKER) network connect --alias searxng $$net llm-agent-searxng >/dev/null 2>&1 || true; \
+	done
 
 search-down: ## Stop SearXNG
 	$(COMPOSE) stop searxng

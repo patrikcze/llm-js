@@ -1,6 +1,7 @@
 /** The web server's access control, against the real server process. */
 import assert from "node:assert/strict";
 import { type ChildProcess, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { request } from "node:http";
 import { createServer } from "node:net";
@@ -9,6 +10,9 @@ import path from "node:path";
 import { after, before, describe, it } from "node:test";
 
 const TOKEN = "t".repeat(8) + "secret-token-for-tests";
+// The session cookie is named after the token (hashed), never the port: every Docker agent listens on
+// 8787 inside its container, and a port-based name made two agents in one browser overwrite each other.
+const COOKIE = `agent_session_${createHash("sha256").update(TOKEN).digest("hex").slice(0, 16)}`;
 let child: ChildProcess;
 let base = "";
 let port = 0;
@@ -102,28 +106,37 @@ describe("access token", () => {
     assert.match(page, /<form method="get" action="\/"><input name="token" type="password"/);
   });
 
+  it("401s carry the open hint, so the UI can say how to get back in", async () => {
+    const body = await (await call("/api/info")).json();
+    assert.equal(body.error, "access token required");
+    assert.equal(body.hint, "make agent-open NAME=t1script");
+  });
+
   it("rejects wrong, empty and near-miss tokens", async () => {
     for (const bad of ["", "wrong", TOKEN.slice(0, -1), `${TOKEN}x`, TOKEN.toUpperCase()]) {
       assert.equal((await call("/api/info", { headers: { "x-agent-token": bad } })).status, 401, JSON.stringify(bad));
       assert.equal((await call(`/?token=${encodeURIComponent(bad)}`)).status, 401, `?token=${bad}`);
     }
-    assert.equal((await call("/api/info", { headers: { cookie: `agent_session_${port}=nope` } })).status, 401);
+    assert.equal((await call("/api/info", { headers: { cookie: `${COOKIE}=nope` } })).status, 401);
   });
 
-  it("signs in with ?token=, sets an HttpOnly SameSite=Strict cookie scoped to this port, and redirects clean", async () => {
+  it("signs in with ?token=, sets an HttpOnly SameSite=Strict cookie named per agent, and redirects clean", async () => {
     const r = await call(`/?token=${TOKEN}`);
     assert.equal(r.status, 302);
     assert.equal(r.headers.get("location"), "/");
     const cookie = r.headers.get("set-cookie") ?? "";
-    assert.match(cookie, new RegExp(`^agent_session_${port}=${TOKEN}; HttpOnly; SameSite=Strict; Path=/`));
+    assert.match(cookie, new RegExp(`^${COOKIE}=${TOKEN}; HttpOnly; SameSite=Strict; Path=/`));
+    assert.doesNotMatch(cookie.split("=")[0]!, new RegExp(String(port)), "the cookie name must not depend on the port");
     const session = cookie.split(";")[0]!;
     const page = await call("/", { headers: { cookie: session } });
     assert.equal(page.status, 200);
     assert.match(await page.text(), /LLM\/\/AGENT/);
     const info = await call("/api/info", { headers: { cookie: session } });
     assert.equal(info.status, 200);
-    // Another agent's cookie (different port) does not work here.
-    assert.equal((await call("/api/info", { headers: { cookie: `agent_session_${port + 1}=${TOKEN}` } })).status, 401);
+    // Another agent's session cookie, sent alongside (same host), neither breaks nor replaces this one.
+    const other = `agent_session_${"0".repeat(16)}=another-agents-token`;
+    assert.equal((await call("/api/info", { headers: { cookie: `${other}; ${session}` } })).status, 200);
+    assert.equal((await call("/api/info", { headers: { cookie: other } })).status, 401);
   });
 
   it("keeps the same-origin protections on top of the token", async () => {

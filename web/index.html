@@ -824,8 +824,28 @@ function message(kind, who) {
 const short = (v, n = 140) => { const s = (typeof v === "string" ? v : JSON.stringify(v) ?? "").replace(/\s+/g, " "); return s.length > n ? s.slice(0, n - 1) + "…" : s; };
 const pad = (n) => String(n).padStart(2, "0");
 
+// Every request goes through call(): a 401 means this tab lost its access (the agent restarted with a
+// new token, or the sign-in expired) and gets one clear notice instead of failing silently.
+let accessLostShown = false;
+function accessLost(hint) {
+  $("sub").textContent = "Access lost · reopen this agent";
+  $("r-link").textContent = "locked";
+  if (accessLostShown) return;
+  accessLostShown = true;
+  add(el("div", "error", `Access to this agent was lost: it restarted with a new token, or its sign-in expired. Reopen it signed in${hint ? ` with: ${hint}` : " from the URL printed when it started"}.`));
+}
+async function call(path, init) {
+  const res = await fetch(path, init);
+  if (res.status === 401) {
+    const body = await res.json().catch(() => ({}));
+    accessLost(body.hint);
+    throw new Error("access token required");
+  }
+  accessLostShown = false;
+  return res;
+}
 async function api(path, data) {
-  const res = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(data ?? {}) });
+  const res = await call(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(data ?? {}) });
   return res.json();
 }
 
@@ -866,7 +886,7 @@ function showResult(r) {
   $("r-usage").textContent = `${r.usage.promptTokens}/${r.usage.completionTokens}`;
   $("r-exit").textContent = r.stopReason;
 }
-const refreshInfo = () => fetch("/api/info").then((r) => r.json()).then(showInfo);
+const refreshInfo = () => call("/api/info").then((r) => r.json()).then(showInfo);
 
 // ---------------------------------------------------------------- one run
 async function run(message_, images = []) {
@@ -968,6 +988,7 @@ async function run(message_, images = []) {
 
   try {
     const res = await fetch("/api/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ message: message_, images: images.map((i) => i.url) }) });
+    if (res.status === 401) { const b = await res.json().catch(() => ({})); accessLost(b.hint); return; }
     if (!res.ok) { handlers.error({ message: (await res.json()).error }); return; }
     // Parse the SSE stream by hand (EventSource cannot POST).
     const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
@@ -1083,7 +1104,7 @@ async function scan() {
 
 async function openConfig() {
   if (busy) return;
-  cfgState = await fetch("/api/settings").then((r) => r.json());
+  cfgState = await call("/api/settings").then((r) => r.json());
   $("cfg-file").textContent = cfgState.file;
   $("cfg-file").title = "Settings are stored here (mode 0600). Keys never leave this machine except to the provider.";
   $("cfg-tiles").replaceChildren(...cfgState.providers.map((p) => {
@@ -1316,8 +1337,8 @@ $("reset").onclick = async () => {
   showInfo(i);
 };
 refreshInfo()
-  .then(async () => {
-    const i = await fetch("/api/info").then((r) => r.json());
+  .then(() => {
+    const i = currentInfo;
     if (!i.model) { typewrite(["No uplink configured", "Open config to select a model"]); openConfig(); }
     else typewrite(["Agent online · awaiting directive", "System status nominal"]);
   })

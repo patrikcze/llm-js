@@ -15,7 +15,7 @@
  * (`?token=…`) into an HttpOnly cookie, or sent as the `x-agent-token` header. AGENT_TOKEN
  * fixes the token (the Makefile does); otherwise a random one is generated at every start.
  */
-import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
@@ -33,7 +33,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const { values: opt } = parseArgs({ options: { ...COMMON_OPTIONS, port: { type: "string", short: "p" } } });
 if (opt.help) {
   console.log(
-    `llm-agent web UI\n\nUsage: node src/server.ts [options]\n\nOptions:\n${COMMON_HELP}\n  -p, --port <n>           port to listen on (env PORT, default 8787)\n\nEnv HOST sets the bind address (default 127.0.0.1).`,
+    `llm-agent web UI\n\nUsage: node src/server.ts [options]\n\nOptions:\n${COMMON_HELP}\n  -p, --port <n>           port to listen on (env PORT, default 8787)\n\nEnv: HOST bind address (default 127.0.0.1) · AGENT_TOKEN access token (default: random per start;\nthe sign-in URL is printed at startup) · AGENT_OPEN_HINT command shown on the access page.`,
   );
   process.exit(0);
 }
@@ -213,8 +213,10 @@ if (token.length < 16) {
   console.error("AGENT_TOKEN must be at least 16 characters.");
   process.exit(2);
 }
-// Cookies are shared between ports on one host (localhost:8787 and localhost:8800), so the name carries the port.
-const cookieName = `agent_session_${port}`;
+// One cookie per agent. Browsers share cookies between all ports of a host, and every Docker agent
+// listens on 8787 inside its container, so neither host nor port tells agents apart. A hash of the
+// token does (without revealing it): two agents in one browser keep separate sessions.
+const cookieName = `agent_session_${createHash("sha256").update(token).digest("hex").slice(0, 16)}`;
 
 function sameSecret(given: string | undefined): boolean {
   if (!given) return false;
@@ -287,7 +289,7 @@ const server = createServer(async (req, res) => {
       if (req.method === "GET" && url.pathname === "/") {
         return res.writeHead(401, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }).end(LOGIN_PAGE);
       }
-      return json(res, 401, { error: "access token required" });
+      return json(res, 401, { error: "access token required", ...(openHint ? { hint: openHint } : {}) });
     }
 
     const asset = req.method === "GET" ? staticFile(url) : undefined;

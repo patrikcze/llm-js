@@ -12,16 +12,19 @@ Node runs the TypeScript directly (≥ 22.18, no build step), or you can run the
 
 ```bash
 cp .env.example .env              # optional: API keys, LLM URL
-docker compose up -d --build      # agent UI + SearXNG search
-open http://127.0.0.1:8787
+make docker-up                    # agent UI + SearXNG; prints "Open: http://127.0.0.1:8787/?token=…"
+make docker-open                  # opens the UI already signed in
 ```
+
+Every agent server requires its **access token** (see [Browser UI security](#browser-ui-security)): open the printed `?token=…` link, or use `make open` / `make docker-open` / `make agent-open NAME=…`, which do it for you. A plain `http://127.0.0.1:<port>` link, such as Docker Desktop's port link, shows an access page where you can paste the token.
 
 **Local Node:**
 
 ```bash
 make setup                        # npm ci, .env, health check
 make search-up                    # SearXNG in Docker (optional but recommended)
-make start                        # UI on http://127.0.0.1:8787 in the background, workspace ./playground
+make start                        # UI in the background (workspace ./playground); prints its token link
+make open                         # opens the UI already signed in
 make cli                          # terminal chat
 node src/cli.ts -w ./playground "Summarise every markdown file into SUMMARY.md"
 ```
@@ -42,9 +45,9 @@ Run `make` to list everything. These are the common ones:
 | `make check` | The CI gate: Biome lint + format check, `tsc`, tests |
 | `make fix` | Apply formatting, import sorting and safe lint fixes |
 | `make coverage`, `make audit` | Coverage report; audit of production dependencies |
-| `make docker-up` / `docker-down` / `docker-logs` | The full Docker stack |
+| `make docker-up` / `docker-open` / `docker-down` / `docker-logs` | The default Docker agent + SearXNG. With `NAME=…`, `docker-up` starts an isolated agent instead (same as `agent-up`). It takes `AGENT_PORT`, not `PORT` |
 | `make search-up` | Only SearXNG, for running the agent with Node |
-| `make agent-up NAME=alpha` / `agent-down` / `agents` / `agent-logs` / `agent-shell` | Isolated agents, each in its own hardened container with its own workspace |
+| `make agent-up NAME=alpha` / `agent-open` / `agent-down` / `agents` / `agent-logs` / `agent-shell` | Isolated agents, each in its own hardened container with its own workspace, settings and token |
 
 Every setting can be overridden: `make start PORT=8800 WORKSPACE=~/code/project MODE=auto-edit MODEL=…`. It works with macOS's GNU Make 3.81. The npm scripts (`npm run check`, `npm run lint`, …) mirror the main targets.
 
@@ -124,11 +127,14 @@ user message
 The LLM stays outside the stack. Inside the container `localhost` is the container itself, so the agent reaches your host's model server via `http://host.docker.internal:9931/v1` (override with `DOCKER_LLM_BASE_URL`). OpenAI and Anthropic need nothing extra.
 
 ```bash
-npm run docker:up        # build + start
-npm run docker:logs
-npm run docker:down
-AGENT_WORKSPACE=~/code/my-project AGENT_PORT=8800 docker compose up -d
+make docker-up                                            # build + start; prints the token link
+make docker-open                                          # open it signed in
+make docker-logs
+make docker-down
+AGENT_WORKSPACE=~/code/my-project make docker-up AGENT_PORT=8800
 ```
+
+`make docker-up` keeps one token in `.run/docker.token` across restarts. Plain `docker compose up` (and the `npm run docker:*` scripts) also work, but then the token is random per start and only shown in the log: `docker compose logs agent | grep Open:`.
 
 On Linux, the container user (uid 1000) needs write access to the mounted workspace.
 
@@ -142,7 +148,9 @@ On Linux, the container user (uid 1000) needs write access to the mounted worksp
   - its own settings volume (provider, model, keys);
   - its own port (a free one is picked unless you pass `AGENT_PORT`).
 
-  Agents share one SearXNG but nothing else: separate workspaces, separate settings, and each agent is on its own Docker network (`llm-agent-<name>-net`). `agent-down` removes the container and its network and token, and keeps the workspace and settings.
+  Agents share one SearXNG but nothing else: separate workspaces, settings and access tokens, and each agent is on its own Docker network (`llm-agent-<name>-net`). Several agents can be open in one browser at the same time, each in its own tab with its own session. `agent-down` removes the container, its network and token, and keeps the workspace and settings. `make docker-up NAME=…` does the same as `make agent-up NAME=…`.
+
+  SearXNG lives in the `llm-js` Compose stack (Docker Desktop shows isolated agents as a separate `llm-agents` group). If SearXNG is removed and recreated (`make docker-down`, or deleting the `llm-js` group), running agents lose web search until it is reattached to their networks. `make docker-up` and `make search-up` do that automatically, or run `make searxng-attach`.
 
   ```bash
   make agent-up NAME=research THINK=off          # → http://127.0.0.1:<port>
@@ -217,8 +225,8 @@ KaTeX and Mermaid are served from `node_modules`, so this works offline and in D
 
 ## Browser UI security
 
-- **Access token.** Every request except `/healthz` needs a secret token. Starting a server prints a URL ending in `/?token=…`; opening it sets an `HttpOnly`, `SameSite=Strict` cookie (named per port, so agents on different ports don't collide) and redirects to the clean URL. `make start`, `make docker-up` and `make agent-up` print the URL, and `make open` / `make agent-open` open it. `AGENT_TOKEN` fixes the token; otherwise it's random per start. This is what stops **one agent from controlling another**: commands the agent runs can otherwise reach other agents' ports through the Docker network or the host gateway (`host.docker.internal`), and the Origin/Host checks are only headers that a program can forge. Tested: from inside one agent, a request to a second agent's published port with forged headers gets `401`. The token is also removed from commands' environments.
-- **Docker networks do not isolate agents on every machine.** I checked: on Docker Desktop here, containers on separate bridge networks could still reach each other through the VM's gateway. Per-agent networks are defense in depth, and the token is the actual boundary. `/healthz` stays open (health checks) and reveals only that something is listening.
+- **Access token.** Every request except `/healthz` needs a secret token. Starting a server prints a URL ending in `/?token=…`; opening it sets an `HttpOnly`, `SameSite=Strict` cookie and redirects to the clean URL. The cookie is named after a hash of the token, not the port: browsers share cookies between all ports of a host, and every Docker agent listens on 8787 inside its container, so a port-based name made two agents in one browser overwrite each other's session. If a tab loses access (the agent restarted with a new token), the UI says so and shows the command to reopen it. `make start`, `make docker-up` and `make agent-up` print the URL, and `make open` / `make agent-open` open it. `AGENT_TOKEN` fixes the token; otherwise it's random per start. This is what stops **one agent from controlling another**: commands the agent runs can otherwise reach other agents' ports through the Docker network or the host gateway (`host.docker.internal`), and the Origin/Host checks are only headers that a program can forge. Tested: from inside one agent, a request to a second agent's published port with forged headers gets `401`. The token is also removed from commands' environments.
+- **Docker networks do not isolate agents on every machine.** On Docker Desktop for Mac (verified), containers on separate bridge networks can still reach each other through the VM's gateway. Per-agent networks are defense in depth, and the token is the actual boundary. `/healthz` stays open (health checks) and reveals only that something is listening.
 - The server binds to `127.0.0.1` by default (`HOST=0.0.0.0` only inside the container).
 - API calls must carry this server's Host and Origin and a JSON body, so other sites in your browser can't drive the agent, and DNS rebinding is blocked. To expose it on a LAN name, add it to `AGENT_ALLOWED_HOSTS` (there is no login, so only do this on a trusted network).
 - Model output is rendered through DOMPurify, under a strict Content-Security-Policy.
@@ -247,7 +255,7 @@ A plain `new OpenAI({ baseURL, apiKey })` client is accepted too. Adding a tool 
 ## Development
 
 ```bash
-make check           # lint + format check, types, 86 tests (no model or network needed)
+make check           # lint + format check, types, 95 tests (no model or network needed)
 make coverage
 ```
 
