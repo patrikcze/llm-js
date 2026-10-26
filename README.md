@@ -17,15 +17,35 @@ open http://127.0.0.1:8787
 **Local Node:**
 
 ```bash
-npm install
-cp .env.example .env
-npm run search:up                 # SearXNG in Docker (optional but recommended)
-npm run playground                # UI on http://127.0.0.1:8787, workspace ./playground
-npm start                         # terminal chat in the current directory
+make setup                        # npm ci, .env, health check
+make search-up                    # SearXNG in Docker (optional but recommended)
+make start                        # UI on http://127.0.0.1:8787 in the background, workspace ./playground
+make cli                          # terminal chat
 node src/cli.ts -w ./playground "Summarise every markdown file into SUMMARY.md"
 ```
 
 Click **⚙ Config** (or the model name) in the UI to choose a provider and model. The choice is saved and reused by the CLI too.
+
+## Make targets
+
+Run `make` to list everything. These are the common ones:
+
+| Command | What it does |
+|---|---|
+| `make setup` | `npm ci`, create `.env` from the example, run `doctor` |
+| `make doctor` | Check Node ≥ 22.18, dependencies, the LLM endpoint, search, the port and Docker |
+| `make start` / `stop` / `restart` / `status` / `logs` | Run the web UI in the background (PID and log in `.run/`), wait until healthy, show provider/model |
+| `make dev` | Foreground server that restarts when `src/` or `web/` change |
+| `make cli`, `make run TASK="…"` | Terminal chat, or a one-shot task |
+| `make check` | The CI gate: Biome lint + format check, `tsc`, tests |
+| `make fix` | Apply formatting, import sorting and safe lint fixes |
+| `make coverage`, `make audit` | Coverage report; audit of production dependencies |
+| `make docker-up` / `docker-down` / `docker-logs` | The full Docker stack |
+| `make search-up` | Only SearXNG, for running the agent with Node |
+
+Every setting can be overridden: `make start PORT=8800 WORKSPACE=~/code/project MODE=auto-edit MODEL=…`. It works with macOS's GNU Make 3.81. The npm scripts (`npm run check`, `npm run lint`, …) mirror the main targets.
+
+Linting and formatting use [Biome](https://biomejs.dev) ([biome.json](biome.json)). `noExplicitAny` and `noNonNullAssertion` are off on purpose: `any` appears only at untyped SDK/JSON/`catch` boundaries, and `tsc --strict` covers the rest.
 
 ## Providers and models
 
@@ -79,6 +99,7 @@ user message
 | Tool | Risk | |
 |---|---|---|
 | `list_dir`, `read_file`, `find_files`, `search_files` | read | explore files; line-numbered reads with ranges, glob, grep |
+| `view_image` | read | look at a PNG/JPEG/GIF/WebP in the workspace (vision models) |
 | `write_file`, `edit_file`, `make_dir`, `move_path` | write | `edit_file` needs an exact, unique snippet |
 | `delete_path` | destructive | asks unless the mode is `auto` |
 | `web_search` | read | Tavily → Brave → SearXNG → DuckDuckGo, whichever is configured first |
@@ -103,6 +124,30 @@ AGENT_WORKSPACE=~/code/my-project AGENT_PORT=8800 docker compose up -d
 ```
 
 On Linux, the container user (uid 1000) needs write access to the mounted workspace.
+
+## Commands, thinking, streaming and images
+
+Type `/` in the UI for a command palette (↑/↓, Tab, Enter). The same commands work in the CLI:
+
+| Command | Effect |
+|---|---|
+| `/think auto\|on\|off` | Reasoning switch. `off` is often much faster for simple tasks: Gemma 4 answered in 0.4 s instead of 11 s. |
+| `/stream on\|off` | Stream tokens live, or wait for whole replies (useful for servers that mangle streamed tool calls). |
+| `/mode <mode>` · `/model` · `/attach` · `/reset` · `/help` | Permission mode · provider/model picker · attach images · new session · list. |
+
+The sidebar's **Thinking** and **Stream** readouts toggle on click. Flags: `--think`, `--no-stream`, or `make start THINK=off`.
+
+How "thinking" maps to each provider:
+
+| Provider | `on` | `off` |
+|---|---|---|
+| llama.cpp / vLLM / SGLang (Local, Custom) | `chat_template_kwargs.enable_thinking: true` | `false`. If a server rejects the field, it is dropped and not sent again. |
+| OpenAI | `reasoning_effort: "high"` | `"minimal"` |
+| Anthropic | adaptive thinking with summarized display; a fixed budget on models before 4.6 | Sonnet 5.5: `between_tools`; Opus 5 / 5.5 and Fable can't turn thinking off, so `effort: "low"`; otherwise `disabled` |
+
+Claude's signed thinking blocks are passed back unchanged across tool calls. History is append-only: a `/mode` change mid-conversation reaches the model as a note on your next message, not as a system-prompt rewrite. If context compaction does invalidate thinking blocks, the adapter strips them and retries once. `temperature` is never sent to Anthropic, because the API rejects it since version 2026-10-21.
+
+**Images (vision).** In the UI you can attach with the clip button, paste, or drag & drop. In the CLI, use `/attach <file>`. Images are re-encoded in the browser to PNG/JPEG at most 1568 px, since llama.cpp can't read WebP. Up to 8 per message. The agent can also look at workspace images itself with the `view_image` tool. If a model rejects images (no vision support, e.g. llama.cpp without `--mmproj`), they're removed and the request is retried once, with a notice.
 
 ## Rich answers
 
@@ -147,8 +192,8 @@ A plain `new OpenAI({ baseURL, apiKey })` client is accepted too. Adding a tool 
 ## Development
 
 ```bash
-npm test             # 33 tests, no model or network needed
-npm run typecheck
+make check           # lint + format check, types, 55 tests (no model or network needed)
+make coverage
 ```
 
 [test/harness.ts](test/harness.ts) is a scripted, OpenAI-compatible mock server. It streams SSE the way llama.cpp does, including split tool-call arguments, and provides `assertValidTranscript`. [test/providers.test.ts](test/providers.test.ts) runs the real agent loop against a mock Anthropic event stream. CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the tests on Node 22 and 24, then builds and smoke-tests the Docker image.

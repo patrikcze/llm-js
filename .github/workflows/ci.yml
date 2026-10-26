@@ -20,8 +20,8 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
+      - run: make check
+      - run: make audit
 
   docker:
     runs-on: ubuntu-latest

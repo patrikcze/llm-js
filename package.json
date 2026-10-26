@@ -20,10 +20,15 @@
   },
   "scripts": {
     "start": "node src/cli.ts",
-    "typecheck": "tsc -p .",
-    "test": "node --test test/*.test.ts",
     "ui": "node src/server.ts",
     "playground": "node src/server.ts -w playground",
+    "doctor": "node scripts/doctor.ts",
+    "check": "biome ci && tsc -p . && node --test test/*.test.ts",
+    "lint": "biome lint",
+    "format": "biome format --write",
+    "fix": "biome check --write",
+    "typecheck": "tsc -p .",
+    "test": "node --test test/*.test.ts",
     "search:up": "docker compose up -d searxng",
     "search:down": "docker compose stop searxng",
     "search:logs": "docker compose logs -f searxng",
@@ -44,6 +49,7 @@
     "undici": "^7.30.1"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.6.3",
     "@types/node": "^26.6.5",
     "@types/turndown": "^5.0.6",
     "typescript": "^7.0.2"

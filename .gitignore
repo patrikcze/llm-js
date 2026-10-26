@@ -5,3 +5,5 @@ node_modules/
 playground/*
 !playground/README.md
 .claude/
+.run/
+coverage/
