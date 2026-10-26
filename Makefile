@@ -195,14 +195,17 @@ audit: ## Audit production dependencies for known vulnerabilities
 docker-build: ## Build the agent image
 	$(COMPOSE) build agent
 
-docker-up: ## Build and start the default agent + SearXNG (one agent; more agents: make agent-up NAME=…)
-	@if [ "$(origin PORT)" = "command line" ] || [ -n "$(NAME)" ]; then \
-	  echo "docker-up runs the one default agent (container llm-agent, port $(or $(AGENT_PORT),8787)); it does not take PORT or NAME." >&2; \
-	  echo "To start an additional isolated agent:  make agent-up NAME=<name> [AGENT_PORT=8801]" >&2; \
-	  echo "To move the default agent to another port:  make docker-up AGENT_PORT=8801" >&2; exit 2; fi
+docker-up: ## Build and start the default agent + SearXNG (with NAME=…: an isolated agent, same as agent-up)
+ifneq ($(NAME),)
+	@echo "NAME given: starting an isolated agent (make agent-up NAME=$(NAME))."
+	@$(MAKE) --no-print-directory agent-up NAME=$(NAME) $(if $(AGENT_PORT),AGENT_PORT=$(AGENT_PORT),)
+else
+	@if [ "$(origin PORT)" = "command line" ]; then \
+	  echo "docker-up uses AGENT_PORT, not PORT (PORT is for make start). Try: make docker-up AGENT_PORT=$(PORT)" >&2; exit 2; fi
 	@mkdir -p $(RUN_DIR); [ -s $(RUN_DIR)/docker.token ] || (umask 077; $(gen_token) > $(RUN_DIR)/docker.token)
 	@AGENT_PORT=$(or $(AGENT_PORT),8787) AGENT_TOKEN=$$(cat $(RUN_DIR)/docker.token) TZ=$(TZ) $(COMPOSE) up -d --build
 	@echo "Open: http://127.0.0.1:$(or $(AGENT_PORT),8787)/?token=$$(cat $(RUN_DIR)/docker.token)"
+endif
 
 docker-down: ## Stop and remove the stack (keeps the settings volume)
 	$(COMPOSE) down
