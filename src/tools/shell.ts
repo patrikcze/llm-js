@@ -30,9 +30,15 @@ const CAPTURE_BYTES = 2_000_000;
 /** After the shell exits, how long to wait for pipes held open by background children. */
 const EXIT_GRACE_MS = 500;
 
+// "Command position": the start of any line (a newline ends a shell command too), or right after
+// ; & | ( $( ` or a keyword/wrapper such as `then`, `exec`, `env`, `xargs`, `nohup`, optionally with
+// a path. So `grep -r sudo` is fine, but `echo hi\nsudo ls`, `x && /usr/bin/sudo ls` and
+// `exec sudo ls` are blocked.
+const POSITION = String.raw`(?:^|[;&|(\`\n\r]|\$\()\s*(?:(?:then|do|else|elif|time|exec|command|builtin|env|nohup|nice|xargs|!)\s+|[A-Za-z_]\w*=\S*\s+)*(?:\\|[\w./-]*/)?`;
+const atCommand = (names: string) => new RegExp(`${POSITION}(?:${names})(?:\\s|$)`);
+
 const BLOCKED: [RegExp, string][] = [
-  // "Command position": start of the line, or after ; & | ( $( ` (so `grep -r sudo` is fine).
-  [/(^|[;&|(`]\s*|\$\(\s*)(sudo|doas|su)(\s|$)/, "privilege escalation (sudo/su) is not available to the agent"],
+  [atCommand("sudo|doas|su"), "privilege escalation (sudo/su) is not available to the agent"],
   [
     /\brm\s+(-\S+\s+)*-\S*[rR]\S*\s+(-\S+\s+)*(\/|\/\*|~|~\/|~\/\*|\$HOME|\$HOME\/|\$HOME\/\*|"\$HOME"|\/(Users|home|root|etc|usr|var|System|bin|sbin|opt|Library)\/?)(\s|;|&|\||$)/,
     "recursive delete of the root, home or a system directory",
@@ -40,7 +46,8 @@ const BLOCKED: [RegExp, string][] = [
   [/\bmkfs(\.\w+)?\b|\bdiskutil\s+(erase|zero|secureErase|partition)/i, "formatting a disk"],
   [/\bdd\b[^|;&]*\bof=\/dev\/|>\s*\/dev\/(sd|disk|nvme|hd)/, "writing to a raw disk device"],
   [/:\s*\(\s*\)\s*\{[^}]*:\s*\|\s*:/, "fork bomb"],
-  [/(^|[;&|(`]\s*|\$\(\s*)(shutdown|reboot|halt|poweroff)(\s|$)|(^|[;&|(]\s*)init\s+[06]\b/, "shutting down or rebooting the machine"],
+  [atCommand("shutdown|reboot|halt|poweroff"), "shutting down or rebooting the machine"],
+  [new RegExp(`${POSITION}init\\s+[06]\\b`), "shutting down or rebooting the machine"],
   [/\b(curl|wget)\b[^|;&]*\|\s*(sudo\s+)?(ba|z|da|k)?sh\b|\b(ba|z)?sh\s+-c\s+"?\$\(\s*(curl|wget)\b/, "downloading and executing a script"],
   [/\bchmod\s+(-\S+\s+)*-R\S*\s+\S*7\S*\s+\/(\s|$)/, "recursive permission change on /"],
 ];
@@ -57,10 +64,26 @@ const SECRET_NAME = /(KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIAL|COO
 const SECRET_PREFIX =
   /^(ANTHROPIC_|OPENAI_|AWS_|AZURE_|GOOGLE_|GCP_|GH_|GITHUB_|GITLAB_|NPM_|HF_|HUGGING|TAVILY_|BRAVE_|SEARXNG_SECRET|AGENT_|LLM_API_KEY|DOCKER_AUTH)/i;
 
+// Values that look like credentials whatever the variable is called: URLs with a password
+// (DATABASE_URL=postgres://user:pw@host/db), well-known token formats, JWTs, and long opaque strings.
+const SECRET_VALUE = new RegExp(
+  [
+    String.raw`^[a-z][a-z0-9+.-]*://[^/\s:@]*:[^/\s@]+@`,
+    String.raw`^(gh[pousr]_|github_pat_|glpat-|xox[abprs]-|sk-|sk_live_|rk_live_|pk_live_|AKIA|ASIA|AIza|npm_|hf_|ya29\.|eyJ[A-Za-z0-9_-]{8,}\.)`,
+    String.raw`^-----BEGIN [A-Z ]*PRIVATE KEY`,
+    String.raw`^[A-Za-z0-9_+=-]{40,}$`,
+  ].join("|"),
+);
+
+/**
+ * The environment commands see. Denylist by variable name AND by value shape, because secrets
+ * have innocent-looking names too. An allowlist would be safer still, but would break the many
+ * tools that read their own settings (JAVA_HOME, GOPATH, npm_config_*, ...).
+ */
 export function commandEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(source)) {
-    if (v === undefined || SECRET_NAME.test(k) || SECRET_PREFIX.test(k)) continue;
+    if (v === undefined || SECRET_NAME.test(k) || SECRET_PREFIX.test(k) || SECRET_VALUE.test(v)) continue;
     env[k] = v;
   }
   return Object.assign(env, {

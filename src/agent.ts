@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import os from "node:os";
 import type OpenAI from "openai";
@@ -206,8 +207,13 @@ function sessionStart(now = new Date()): string {
  * allowing `git status` must not allow `git push`.
  */
 export function approvalKey(req: { tool: string; args: unknown }): string {
-  if (req.tool === "run_command") return `run_command:${String((req.args as { command?: unknown })?.command ?? "")}`;
-  return req.tool;
+  if (req.tool !== "run_command") return req.tool;
+  // Everything that changes what a command does is part of the key: the directory it runs in and
+  // its standard input (`cat > f` with different stdin is a different action). The timeout is not:
+  // it only limits the command.
+  const a = (req.args ?? {}) as { command?: unknown; cwd?: unknown; stdin?: unknown };
+  const stdin = typeof a.stdin === "string" && a.stdin ? createHash("sha256").update(a.stdin).digest("hex").slice(0, 16) : "";
+  return `run_command:${String(a.cwd ?? ".")}:${stdin}:${String(a.command ?? "")}`;
 }
 
 const ELIDED = "[older tool output removed to save context]";
