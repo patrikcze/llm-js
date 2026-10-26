@@ -14,10 +14,10 @@ import { readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Agent, type ApprovalRequest, type PermissionMode } from "./agent.ts";
-import { COMMON_HELP, COMMON_OPTIONS, ConfigError, MODES, parseArgs, resolveConfig } from "./config.ts";
+import { Agent, type ApprovalRequest, type PermissionMode, type UserInput } from "./agent.ts";
+import { COMMON_HELP, COMMON_OPTIONS, ConfigError, MODES, parseArgs, resolveConfig, THINKING } from "./config.ts";
 import { createChatClient, PROVIDERS, ProviderError, type ProviderKind } from "./providers.ts";
-import { loadSettings, publicProviders, saveSettings, settingsPath, type SavedSettings } from "./settings.ts";
+import { loadSettings, publicProviders, type SavedSettings, saveSettings, settingsPath } from "./settings.ts";
 import { fsTools } from "./tools/fs.ts";
 import { ToolError } from "./tools/types.ts";
 import { fetchImage, searchProviderName, webTools } from "./tools/web.ts";
@@ -26,7 +26,9 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const { values: opt } = parseArgs({ options: { ...COMMON_OPTIONS, port: { type: "string", short: "p" } } });
 if (opt.help) {
-  console.log(`llm-agent web UI\n\nUsage: node src/server.ts [options]\n\nOptions:\n${COMMON_HELP}\n  -p, --port <n>           port to listen on (env PORT, default 8787)\n\nEnv HOST sets the bind address (default 127.0.0.1).`);
+  console.log(
+    `llm-agent web UI\n\nUsage: node src/server.ts [options]\n\nOptions:\n${COMMON_HELP}\n  -p, --port <n>           port to listen on (env PORT, default 8787)\n\nEnv HOST sets the bind address (default 127.0.0.1).`,
+  );
   process.exit(0);
 }
 
@@ -35,13 +37,24 @@ try {
   cfg = await resolveConfig(opt, { requireModel: false });
 } catch (e) {
   if (!(e instanceof ConfigError)) throw e;
+  if (e.usage) {
+    console.error(e.message);
+    process.exit(2);
+  }
   // A broken saved provider (e.g. key removed) must not keep the UI from starting.
   console.error(`${e.message}\nStarting with the local provider; pick one in the UI.`);
   cfg = await resolveConfig({ ...opt, "base-url": opt["base-url"] ?? PROVIDERS.local.defaultBaseURL }, { requireModel: false });
 }
 const port = Number(opt.port ?? process.env.PORT ?? 8787);
 const host = process.env.HOST || "127.0.0.1";
-const allowedHosts = new Set(["127.0.0.1", "localhost", ...(process.env.AGENT_ALLOWED_HOSTS ?? "").split(",").map((h) => h.trim()).filter(Boolean)]);
+const allowedHosts = new Set([
+  "127.0.0.1",
+  "localhost",
+  ...(process.env.AGENT_ALLOWED_HOSTS ?? "")
+    .split(",")
+    .map((h) => h.trim())
+    .filter(Boolean),
+]);
 
 // --- state (one local user, one conversation) -------------------------------
 
@@ -78,6 +91,8 @@ const agent = new Agent({
   contextTokens: cfg.contextTokens,
   maxOutputTokens: cfg.maxOutputTokens,
   temperature: cfg.temperature,
+  thinking: cfg.thinking,
+  stream: cfg.stream,
   events: {
     onText: (d) => send?.("text", d),
     onReasoning: (d) => send?.("reasoning", d),
@@ -103,6 +118,8 @@ function info() {
     busy: Boolean(running),
     tokens: agent.estimateTokens(),
     contextTokens: agent.contextTokens,
+    thinking: agent.thinking,
+    stream: agent.streaming,
     imageToken,
   };
 }
@@ -124,8 +141,28 @@ function clientFromForm(form: { provider: ProviderKind; baseURL?: string; apiKey
   return { client: createChatClient({ kind: form.provider, baseURL, apiKey }), apiKey, baseURL };
 }
 
+const MAX_IMAGES = 8;
+const MAX_IMAGE_CHARS = 10_000_000; // ~7.5 MB per image after base64
+const MAX_RUN_BODY = MAX_IMAGES * MAX_IMAGE_CHARS + 1_000_000;
+
+/** Attached images must be base64 data URLs of the formats every provider accepts. */
+function checkImages(images: unknown): string | undefined {
+  if (!Array.isArray(images)) return "images must be an array";
+  if (images.length > MAX_IMAGES) return `at most ${MAX_IMAGES} images per message`;
+  for (const img of images) {
+    if (typeof img !== "string" || !/^data:image\/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+=*$/.test(img)) {
+      return "images must be PNG, JPEG, GIF or WebP data URLs";
+    }
+    if (img.length > MAX_IMAGE_CHARS) return "an image is too large (max ~7.5 MB)";
+  }
+  return undefined;
+}
+
 function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
-  return Promise.race([p, new Promise<T>((_, rej) => setTimeout(() => rej(new ProviderError(`${what} timed out after ${ms / 1000}s`)), ms))]);
+  return Promise.race([
+    p,
+    new Promise<T>((_, rej) => setTimeout(() => rej(new ProviderError(`${what} timed out after ${ms / 1000}s`)), ms)),
+  ]);
 }
 
 // --- HTTP ---------------------------------------------------------------------
@@ -170,11 +207,11 @@ function sameOrigin(req: IncomingMessage): boolean {
   return origin === `http://${hostHeader}` && (req.headers["content-type"] ?? "").startsWith("application/json");
 }
 
-async function body(req: IncomingMessage): Promise<any> {
+async function body(req: IncomingMessage, max = 1_000_000): Promise<any> {
   let raw = "";
   for await (const c of req) {
     raw += c;
-    if (raw.length > 1_000_000) throw new Error("body too large");
+    if (raw.length > max) throw new Error("body too large");
   }
   return raw ? JSON.parse(raw) : {};
 }
@@ -230,18 +267,27 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && url.pathname === "/api/run") {
-      const { message } = await body(req);
-      if (typeof message !== "string" || !message.trim()) return json(res, 400, { error: "message required" });
+      const { message, images = [] } = await body(req, MAX_RUN_BODY);
+      if (typeof message !== "string" || (!message.trim() && !images.length)) return json(res, 400, { error: "message required" });
+      const problem = checkImages(images);
+      if (problem) return json(res, 400, { error: problem });
       if (running) return json(res, 409, { error: "the agent is already working" });
       if (!agent.model) return json(res, 400, { error: "No model selected. Open CONFIG and pick a provider and model." });
 
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", connection: "keep-alive" });
-      const ac = (running = new AbortController());
+      const ac = new AbortController();
+      running = ac;
       send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
       // Closing the tab or reloading cancels the run.
       res.on("close", () => ac.abort());
       try {
-        const result = await agent.run(message, ac.signal);
+        const input: UserInput = images.length
+          ? [
+              { type: "text", text: message.trim() || "(see the attached image)" },
+              ...images.map((url: string) => ({ type: "image_url" as const, image_url: { url } })),
+            ]
+          : message;
+        const result = await agent.run(input, ac.signal);
         send("done", result);
       } catch (e: any) {
         send("error", { message: `${e?.status ? `HTTP ${e.status}: ` : ""}${e?.message ?? e}` });
@@ -273,6 +319,17 @@ const server = createServer(async (req, res) => {
       if (running) return json(res, 409, { error: "stop the agent first" });
       agent.reset();
       alwaysAllow.clear();
+      return json(res, 200, info());
+    }
+
+    // Reasoning and streaming switches; they apply from the next model request.
+    if (req.method === "POST" && url.pathname === "/api/options") {
+      const { thinking, stream } = await body(req);
+      if (thinking !== undefined && !THINKING.includes(thinking))
+        return json(res, 400, { error: `thinking must be one of ${THINKING.join(", ")}` });
+      if (stream !== undefined && typeof stream !== "boolean") return json(res, 400, { error: "stream must be true or false" });
+      if (thinking !== undefined) agent.setThinking(thinking);
+      if (stream !== undefined) agent.setStreaming(stream);
       return json(res, 200, info());
     }
 
@@ -310,8 +367,9 @@ const server = createServer(async (req, res) => {
       const form = await body(req);
       if (typeof form.model !== "string" || !form.model.trim()) return json(res, 400, { error: "Pick a model." });
       const contextTokens = Number(form.contextTokens) || PROVIDERS[form.provider as ProviderKind]?.defaultContextTokens;
-      if (!Number.isInteger(contextTokens) || contextTokens < 2048) return json(res, 400, { error: "Context window must be at least 2048 tokens." });
-      let built;
+      if (!Number.isInteger(contextTokens) || contextTokens < 2048)
+        return json(res, 400, { error: "Context window must be at least 2048 tokens." });
+      let built: ReturnType<typeof clientFromForm>;
       try {
         built = clientFromForm(form);
       } catch (e: any) {
@@ -341,7 +399,9 @@ const server = createServer(async (req, res) => {
 
 server.listen(port, host, () => {
   console.log(host === "0.0.0.0" ? `llm-agent UI listening on 0.0.0.0:${port} (container)` : `llm-agent UI: http://${host}:${port}`);
-  console.log(`${PROVIDERS[active.provider].label} · ${agent.model || "(no model selected)"} @ ${active.baseURL} · workspace ${cfg.workspace} · mode ${cfg.mode}`);
+  console.log(
+    `${PROVIDERS[active.provider].label} · ${agent.model || "(no model selected)"} @ ${active.baseURL} · workspace ${cfg.workspace} · mode ${cfg.mode}`,
+  );
 });
 
 for (const sig of ["SIGINT", "SIGTERM"] as const) {

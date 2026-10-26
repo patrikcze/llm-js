@@ -1,10 +1,10 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseArgs, type ParseArgsConfig } from "node:util";
+import { type ParseArgsConfig, parseArgs } from "node:util";
 import OpenAI from "openai";
 import type { PermissionMode } from "./agent.ts";
-import { createChatClient, PROVIDERS, ProviderError, type ChatClient, type ProviderKind } from "./providers.ts";
+import { type ChatClient, createChatClient, PROVIDERS, ProviderError, type ProviderKind, type ThinkingMode } from "./providers.ts";
 import { loadSettings } from "./settings.ts";
 
 // Load the project's .env (SEARXNG_URL, API keys, ...). Variables already set in the shell win.
@@ -13,6 +13,7 @@ try {
 } catch {}
 
 export const MODES: PermissionMode[] = ["read-only", "ask", "auto-edit", "auto"];
+export const THINKING: ThinkingMode[] = ["auto", "on", "off"];
 
 /** Options shared by the CLI and the web UI. */
 export const COMMON_OPTIONS = {
@@ -26,6 +27,8 @@ export const COMMON_OPTIONS = {
   ctx: { type: "string" },
   "max-tokens": { type: "string" },
   temperature: { type: "string", short: "t" },
+  think: { type: "string" },
+  "no-stream": { type: "boolean" },
   help: { type: "boolean", short: "h" },
 } as const satisfies ParseArgsConfig["options"];
 
@@ -38,18 +41,27 @@ export const COMMON_HELP = `  -m, --model <id>         model id (default: saved 
       --max-steps <n>      model rounds per task (default 50)
       --ctx <tokens>       context window (default: from the provider, 32768 for local)
       --max-tokens <n>     max output tokens per round (default 4096)
-  -t, --temperature <x>    sampling temperature
+  -t, --temperature <x>    sampling temperature (ignored by Anthropic, which no longer accepts it)
+      --think <mode>       auto | on | off   reasoning switch (default: auto = the model decides)
+      --no-stream          wait for whole replies instead of streaming tokens
   -h, --help
 
 Provider and model chosen in the browser UI are saved to ~/.llm-agent/settings.json
 (AGENT_CONFIG_DIR) and reused here unless -m/-u/-k are given.`;
 
-export class ConfigError extends Error {}
+/** `usage` is true for invalid flags (fatal), false for provider problems (the UI can recover). */
+export class ConfigError extends Error {
+  readonly usage: boolean;
+  constructor(message: string, usage = false) {
+    super(message);
+    this.usage = usage;
+  }
+}
 
 function intOpt(name: string, v: string | undefined): number | undefined {
   if (v === undefined) return undefined;
   const n = Number(v);
-  if (!Number.isInteger(n) || n <= 0) throw new ConfigError(`--${name} must be a positive integer`);
+  if (!Number.isInteger(n) || n <= 0) throw new ConfigError(`--${name} must be a positive integer`, true);
   return n;
 }
 
@@ -71,9 +83,11 @@ async function autoPickModel(baseURL: string, apiKey: string | undefined): Promi
 export async function resolveConfig(opt: CommonValues, { requireModel = true } = {}) {
   const workspace = path.resolve(opt.workspace ?? process.cwd());
   const mode = (opt.yes ? "auto" : (opt.mode ?? "ask")) as PermissionMode;
-  if (!MODES.includes(mode)) throw new ConfigError(`--mode must be one of ${MODES.join(", ")}`);
+  if (!MODES.includes(mode)) throw new ConfigError(`--mode must be one of ${MODES.join(", ")}`, true);
   const temperature = opt.temperature !== undefined ? Number(opt.temperature) : undefined;
-  if (temperature !== undefined && !Number.isFinite(temperature)) throw new ConfigError("--temperature must be a number");
+  if (temperature !== undefined && !Number.isFinite(temperature)) throw new ConfigError("--temperature must be a number", true);
+  const thinking = (opt.think ?? "auto") as ThinkingMode;
+  if (!THINKING.includes(thinking)) throw new ConfigError(`--think must be one of ${THINKING.join(", ")}`, true);
 
   const flagsGiven = Boolean(opt.model || opt["base-url"] || opt["api-key"]);
   const saved = flagsGiven ? null : loadSettings();
@@ -130,6 +144,8 @@ export async function resolveConfig(opt: CommonValues, { requireModel = true } =
     contextTokens,
     maxOutputTokens: intOpt("max-tokens", opt["max-tokens"]),
     temperature,
+    thinking,
+    stream: !opt["no-stream"],
   };
 }
 

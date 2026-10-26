@@ -58,14 +58,11 @@ describe("agent loop", () => {
     const t = await setup();
     try {
       await writeFile(path.join(t.workspace, "notes.txt"), "alpha\nbeta\n");
-      t.llm.enqueue(
-        { content: "Let me read it.", tool_calls: [{ name: "read_file", args: { path: "notes.txt" } }] },
-        (req) => {
-          const [res] = toolResults(req);
-          assert.match(res!, /1\talpha/);
-          return { content: "The file has alpha and beta." };
-        },
-      );
+      t.llm.enqueue({ content: "Let me read it.", tool_calls: [{ name: "read_file", args: { path: "notes.txt" } }] }, (req) => {
+        const [res] = toolResults(req);
+        assert.match(res!, /1\talpha/);
+        return { content: "The file has alpha and beta." };
+      });
       const r = await t.agent.run("what's in notes.txt?");
       assert.equal(r.text, "The file has alpha and beta.");
       assert.equal(r.toolCalls.length, 1);
@@ -83,7 +80,12 @@ describe("agent loop", () => {
       await writeFile(path.join(t.workspace, "a.txt"), "AAA");
       await writeFile(path.join(t.workspace, "b.txt"), "BBB");
       t.llm.enqueue(
-        { tool_calls: [{ name: "read_file", args: { path: "a.txt" } }, { name: "read_file", args: { path: "b.txt" } }] },
+        {
+          tool_calls: [
+            { name: "read_file", args: { path: "a.txt" } },
+            { name: "read_file", args: { path: "b.txt" } },
+          ],
+        },
         (req) => {
           const res = toolResults(req);
           assert.equal(res.length, 2);
@@ -122,7 +124,10 @@ describe("agent loop", () => {
       );
       const r = await t.agent.run("go");
       assert.equal(r.text, "recovered");
-      assert.deepEqual(r.toolCalls.map((c) => c.status), ["error", "error", "error", "error"]);
+      assert.deepEqual(
+        r.toolCalls.map((c) => c.status),
+        ["error", "error", "error", "error"],
+      );
       assertValidTranscript(t.agent.messages);
     } finally {
       await t.cleanup();
@@ -165,7 +170,7 @@ describe("agent loop", () => {
     try {
       t.llm.enqueue(
         { tool_calls: [{ name: "list_dir", args: {} }] },
-        { tool_calls: [{ name: "list_dir", args: { path: "." , recursive: true } }] },
+        { tool_calls: [{ name: "list_dir", args: { path: ".", recursive: true } }] },
         (req) => {
           assert.equal(req.tools, undefined, "summary request must not offer tools");
           assert.match(String(req.messages.at(-1)!.content), /step limit/);
@@ -319,7 +324,13 @@ describe("permission policy", () => {
 
   it("auto-edit: writes run, destructive actions still ask", async () => {
     const asked: string[] = [];
-    const t = await setup({ permissions: { mode: "auto-edit" }, approve: async (r) => (asked.push(r.tool), false) });
+    const t = await setup({
+      permissions: { mode: "auto-edit" },
+      approve: async (r) => {
+        asked.push(r.tool);
+        return false;
+      },
+    });
     try {
       t.llm.enqueue(writeCall, { tool_calls: [{ name: "delete_path", args: { path: "out.txt" } }] }, { content: "ok" });
       await t.agent.run("write then delete");
@@ -330,14 +341,35 @@ describe("permission policy", () => {
     }
   });
 
-  it("deny list wins over auto mode; setPermissionMode updates the system prompt", async () => {
+  it("deny list wins over auto mode", async () => {
     const t = await setup({ permissions: { mode: "auto", deny: ["write_file"] } });
     try {
       t.llm.enqueue(writeCall, { content: "ok" });
       const r = await t.agent.run("write");
       assert.equal(r.toolCalls[0]!.status, "denied");
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  it("setPermissionMode: rebuilds the prompt before the first message, appends a note afterwards", async () => {
+    const t = await setup({ permissions: { mode: "auto" } });
+    try {
       t.agent.setPermissionMode("read-only");
       assert.match(String(t.agent.messages[0]!.content), /You may only read/);
+      t.llm.enqueue({ content: "hi" }, { content: "noted" });
+      await t.agent.run("hello");
+      const systemBefore = t.agent.messages[0]!.content;
+      t.agent.setPermissionMode("auto-edit");
+      await t.agent.run("go on");
+      // Append-only history: the system prompt is untouched (prompt caching, Claude's signed
+      // thinking), and the change reaches the model with the next user message.
+      assert.equal(t.agent.messages[0]!.content, systemBefore);
+      assert.match(
+        String(t.llm.requests[1]!.messages.at(-1)!.content),
+        /^\[Permission mode changed to "auto-edit": Writes run immediately/,
+      );
+      assertValidTranscript(t.agent.messages);
     } finally {
       await t.cleanup();
     }
@@ -460,7 +492,12 @@ describe("filesystem tools", () => {
       await writeFile(path.join(t.workspace, "src/deep/x.ts"), "export const TODO_ME = 1;\n");
       await writeFile(path.join(t.workspace, "node_modules/pkg/y.ts"), "TODO_ME\n");
       t.llm.enqueue(
-        { tool_calls: [{ name: "find_files", args: { pattern: "**/*.ts" } }, { name: "search_files", args: { query: "todo_me" } }] },
+        {
+          tool_calls: [
+            { name: "find_files", args: { pattern: "**/*.ts" } },
+            { name: "search_files", args: { query: "todo_me" } },
+          ],
+        },
         (req) => {
           const [found, grep] = toolResults(req);
           assert.equal(found, "src/deep/x.ts");

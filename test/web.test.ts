@@ -26,10 +26,29 @@ describe("htmlToMarkdown", () => {
 describe("isPrivateAddress", () => {
   it("catches every encoding of local/private addresses", () => {
     for (const ip of [
-      "127.0.0.1", "10.1.2.3", "172.31.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0", "224.0.0.1",
-      "::1", "::", "::ffff:127.0.0.1", "::ffff:7f00:1", "0:0:0:0:0:ffff:7f00:1", "::127.0.0.1",
-      "64:ff9b::7f00:1", "2002:7f00:1::", "fd00::1", "fe80::1", "fec0::1", "ff02::1", "not-an-ip",
-    ]) assert.equal(isPrivateAddress(ip), true, ip);
+      "127.0.0.1",
+      "10.1.2.3",
+      "172.31.0.1",
+      "192.168.1.1",
+      "169.254.169.254",
+      "100.64.0.1",
+      "0.0.0.0",
+      "224.0.0.1",
+      "::1",
+      "::",
+      "::ffff:127.0.0.1",
+      "::ffff:7f00:1",
+      "0:0:0:0:0:ffff:7f00:1",
+      "::127.0.0.1",
+      "64:ff9b::7f00:1",
+      "2002:7f00:1::",
+      "fd00::1",
+      "fe80::1",
+      "fec0::1",
+      "ff02::1",
+      "not-an-ip",
+    ])
+      assert.equal(isPrivateAddress(ip), true, ip);
     for (const ip of ["1.1.1.1", "8.8.8.8", "93.184.216.34", "2606:4700:4700::1111", "2a00:1450:4001::200e"]) {
       assert.equal(isPrivateAddress(ip), false, ip);
     }
@@ -76,7 +95,8 @@ describe("web_fetch", () => {
       `http://0x7f.1:${port}/page`,
       `http://0.0.0.0:${port}/page`,
       `http://localhost:${port}/page`,
-    ]) await assert.rejects(webFetchTool.run({ url: u }, ctx), /private\/local address/, u);
+    ])
+      await assert.rejects(webFetchTool.run({ url: u }, ctx), /private\/local address/, u);
   });
 
   it("fetchImage (UI image proxy): raster only, size-capped, same address guard", async () => {

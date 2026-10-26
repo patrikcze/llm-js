@@ -12,6 +12,8 @@ import type { ChatCompletionFunctionTool } from "openai/resources/chat/completio
 //   - Recoverable failures are thrown as `ToolError` (message shown to the model).
 //     Any other exception is treated as a bug and reported as an internal error.
 //   - The returned string is what the model sees. Keep it compact and self-describing.
+//     A tool may instead return { text, images }: the images are shown to the model right
+//     after the tool results (requires a vision-capable model).
 // ===========================================================================
 
 /** How dangerous a tool is. Drives the permission policy. */
@@ -45,7 +47,8 @@ export interface JSONSchema {
   additionalProperties?: boolean;
 }
 
-export interface Tool<Args = any> {
+/** `Out` narrows the result type for tools that only return text. */
+export interface Tool<Args = any, Out extends string | ToolOutput = string | ToolOutput> {
   /** snake_case, unique within an agent. */
   name: string;
   /** Tells the model when and how to use the tool. */
@@ -58,7 +61,19 @@ export interface Tool<Args = any> {
    * cannot succeed) and describes the effect. Must not change anything.
    */
   describe?(args: Args, ctx: ToolContext): Promise<ActionDescription>;
-  run(args: Args, ctx: ToolContext): Promise<string>;
+  run(args: Args, ctx: ToolContext): Promise<Out>;
+}
+
+/** An image for the model: base64 bytes plus their media type. */
+export interface ImageData {
+  mime: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+  data: string;
+}
+
+/** Rich tool result: text for the tool message, images shown to the model afterwards. */
+export interface ToolOutput {
+  text: string;
+  images?: ImageData[];
 }
 
 /** A failure the model should read and recover from (bad path, not found, declined, ...). */
@@ -118,7 +133,9 @@ export function validateArgs(schema: JSONSchema, value: unknown, at = "arguments
   if (t === "integer" && !Number.isInteger(value)) errors.push(`${at} must be an integer`);
   if (t === "array") {
     if (!Array.isArray(value)) errors.push(`${at} must be an array`);
-    else if (schema.items) value.forEach((v, i) => errors.push(...validateArgs(schema.items!, v, `${at}[${i}]`)));
+    else if (schema.items) {
+      for (const [i, v] of value.entries()) errors.push(...validateArgs(schema.items, v, `${at}[${i}]`));
+    }
   }
   if (typeof value === "number") {
     if (schema.minimum !== undefined && value < schema.minimum) errors.push(`${at} must be >= ${schema.minimum}`);
@@ -154,5 +171,5 @@ export function coerceArgs(schema: JSONSchema, value: unknown): unknown {
 export function truncate(text: string, max: number, hint = ""): string {
   if (text.length <= max) return text;
   const omitted = text.length - max;
-  return `${text.slice(0, max)}\n\n[... truncated ${omitted} characters.${hint ? " " + hint : ""}]`;
+  return `${text.slice(0, max)}\n\n[... truncated ${omitted} characters.${hint ? ` ${hint}` : ""}]`;
 }

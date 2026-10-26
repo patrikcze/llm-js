@@ -16,22 +16,32 @@ describe("toAnthropicMessages", () => {
     const { system, messages } = toAnthropicMessages([
       { role: "system", content: "rules" },
       { role: "user", content: "hi" },
-      { role: "assistant", content: "Reading.", tool_calls: [
-        { id: "call:1", type: "function", function: { name: "read_file", arguments: '{"path":"a"}' } },
-        { id: "call:2", type: "function", function: { name: "list_dir", arguments: "not json" } },
-      ] },
+      {
+        role: "assistant",
+        content: "Reading.",
+        tool_calls: [
+          { id: "call:1", type: "function", function: { name: "read_file", arguments: '{"path":"a"}' } },
+          { id: "call:2", type: "function", function: { name: "list_dir", arguments: "not json" } },
+        ],
+      },
       { role: "tool", tool_call_id: "call:1", content: "data" },
       { role: "tool", tool_call_id: "call:2", content: "Error: boom" },
       { role: "user", content: "next" },
     ]);
     assert.equal(system, "rules");
-    assert.deepEqual(messages.map((m) => m.role), ["user", "assistant", "user"]);
+    assert.deepEqual(
+      messages.map((m) => m.role),
+      ["user", "assistant", "user"],
+    );
     const [text, use1, use2] = messages[1]!.content as any[];
     assert.deepEqual(text, { type: "text", text: "Reading." });
     assert.deepEqual(use1, { type: "tool_use", id: "call_1", name: "read_file", input: { path: "a" } });
     assert.deepEqual(use2.input, {});
     const results = messages[2]!.content as any[];
-    assert.deepEqual(results.map((b) => b.type), ["tool_result", "tool_result", "text"]);
+    assert.deepEqual(
+      results.map((b) => b.type),
+      ["tool_result", "tool_result", "text"],
+    );
     assert.equal(results[0].tool_use_id, "call_1");
     assert.equal(results[1].is_error, true);
   });
@@ -61,20 +71,47 @@ describe("Anthropic adapter end to end", () => {
   const sse = (events: object[]) => events.map((e: any) => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join("");
   const start = (id: string) => ({
     type: "message_start",
-    message: { id, type: "message", role: "assistant", content: [], model: "claude-test", stop_reason: null, stop_sequence: null, usage: { input_tokens: 120, output_tokens: 1 } },
+    message: {
+      id,
+      type: "message",
+      role: "assistant",
+      content: [],
+      model: "claude-test",
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: 120, output_tokens: 1 },
+    },
   });
 
   before(async () => {
     server = createServer(async (req, res) => {
       if (req.method === "GET" && req.url?.startsWith("/v1/models")) {
         res.writeHead(200, { "content-type": "application/json" });
-        return res.end(JSON.stringify({
-          data: [
-            { id: "claude-test", display_name: "Claude Test", type: "model", created_at: "2026-01-01T00:00:00Z", max_input_tokens: 200000, lifecycle: "active" },
-            { id: "claude-old", display_name: "Claude Old", type: "model", created_at: "2024-01-01T00:00:00Z", max_input_tokens: 100000, lifecycle: "retired" },
-          ],
-          has_more: false, first_id: "claude-test", last_id: "claude-old",
-        }));
+        return res.end(
+          JSON.stringify({
+            data: [
+              {
+                id: "claude-test",
+                display_name: "Claude Test",
+                type: "model",
+                created_at: "2026-01-01T00:00:00Z",
+                max_input_tokens: 200000,
+                lifecycle: "active",
+              },
+              {
+                id: "claude-old",
+                display_name: "Claude Old",
+                type: "model",
+                created_at: "2024-01-01T00:00:00Z",
+                max_input_tokens: 100000,
+                lifecycle: "retired",
+              },
+            ],
+            has_more: false,
+            first_id: "claude-test",
+            last_id: "claude-old",
+          }),
+        );
       }
       let body = "";
       for await (const c of req) body += c;
@@ -82,27 +119,31 @@ describe("Anthropic adapter end to end", () => {
       headers.push(req.headers);
       res.writeHead(200, { "content-type": "text/event-stream" });
       if (requests.length === 1) {
-        res.end(sse([
-          start("msg_1"),
-          { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
-          { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Let me read it." } },
-          { type: "content_block_stop", index: 0 },
-          { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "toolu_01", name: "read_file", input: {} } },
-          { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '{"path": ' } },
-          { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '"a.txt"}' } },
-          { type: "content_block_stop", index: 1 },
-          { type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: 30 } },
-          { type: "message_stop" },
-        ]));
+        res.end(
+          sse([
+            start("msg_1"),
+            { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+            { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Let me read it." } },
+            { type: "content_block_stop", index: 0 },
+            { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "toolu_01", name: "read_file", input: {} } },
+            { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '{"path": ' } },
+            { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '"a.txt"}' } },
+            { type: "content_block_stop", index: 1 },
+            { type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: 30 } },
+            { type: "message_stop" },
+          ]),
+        );
       } else {
-        res.end(sse([
-          start("msg_2"),
-          { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
-          { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "It says hello." } },
-          { type: "content_block_stop", index: 0 },
-          { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 5 } },
-          { type: "message_stop" },
-        ]));
+        res.end(
+          sse([
+            start("msg_2"),
+            { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+            { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "It says hello." } },
+            { type: "content_block_stop", index: 0 },
+            { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 5 } },
+            { type: "message_stop" },
+          ]),
+        );
       }
     });
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
@@ -129,7 +170,10 @@ describe("Anthropic adapter end to end", () => {
       const r = await agent.run("what is in a.txt?");
       assert.equal(r.text, "It says hello.");
       assert.equal(r.stopReason, "completed");
-      assert.deepEqual(r.toolCalls.map((c) => [c.name, c.status]), [["read_file", "ok"]]);
+      assert.deepEqual(
+        r.toolCalls.map((c) => [c.name, c.status]),
+        [["read_file", "ok"]],
+      );
       assert.deepEqual(r.usage, { promptTokens: 240, completionTokens: 35 });
       assertValidTranscript(agent.messages);
 

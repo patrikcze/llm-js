@@ -4,8 +4,8 @@
  * including tool-call arguments split across chunks, so the real streaming code path is tested.
  */
 import assert from "node:assert/strict";
-import { createServer, type IncomingMessage, type Server } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
+import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -51,10 +51,12 @@ export class MockLLM {
   }
 
   async start(): Promise<this> {
-    this.server = createServer((req, res) => this.handle(req, res).catch((e) => {
-      res.statusCode = 500;
-      res.end(String(e?.stack ?? e));
-    }));
+    this.server = createServer((req, res) =>
+      this.handle(req, res).catch((e) => {
+        res.statusCode = 500;
+        res.end(String(e?.stack ?? e));
+      }),
+    );
     await new Promise<void>((r) => this.server.listen(0, "127.0.0.1", r));
     this.url = `http://127.0.0.1:${(this.server.address() as AddressInfo).port}`;
     return this;
@@ -97,6 +99,38 @@ export class MockLLM {
       return;
     }
 
+    // Non-streaming request: one JSON chat completion.
+    if (request.stream === false) {
+      const toolCalls = (reply.tool_calls ?? []).map((tc, i) => ({
+        id: tc.id ?? `call_${this.requests.length}_${i}`,
+        type: "function",
+        function: { name: tc.name, arguments: typeof tc.args === "string" ? tc.args : JSON.stringify(tc.args) },
+      }));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          id: "chatcmpl-mock",
+          object: "chat.completion",
+          created: 0,
+          model: request.model,
+          choices: [
+            {
+              index: 0,
+              finish_reason: reply.finish_reason ?? (toolCalls.length ? "tool_calls" : "stop"),
+              message: {
+                role: "assistant",
+                content: reply.content ?? null,
+                reasoning_content: reply.reasoning,
+                ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+              },
+            },
+          ],
+          usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 },
+        }),
+      );
+      return;
+    }
+
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
     const base = { id: "chatcmpl-mock", object: "chat.completion.chunk", created: 0, model: request.model };
     const send = (delta: object, finish: string | null = null) =>
@@ -110,14 +144,25 @@ export class MockLLM {
     (reply.tool_calls ?? []).forEach((tc, index) => {
       const args = typeof tc.args === "string" ? tc.args : JSON.stringify(tc.args);
       const mid = Math.floor(args.length / 2);
-      send({ tool_calls: [{ index, id: tc.id ?? `call_${this.requests.length}_${index}`, type: "function", function: { name: tc.name, arguments: args.slice(0, mid) } }] });
+      send({
+        tool_calls: [
+          {
+            index,
+            id: tc.id ?? `call_${this.requests.length}_${index}`,
+            type: "function",
+            function: { name: tc.name, arguments: args.slice(0, mid) },
+          },
+        ],
+      });
       send({ tool_calls: [{ index, function: { arguments: args.slice(mid) } }] });
     });
     const finish = reply.finish_reason ?? (reply.tool_calls?.length ? "tool_calls" : "stop");
     send({}, finish);
     // Like a real server, count the tool schemas as part of the prompt.
     const promptChars = JSON.stringify(request.messages).length + JSON.stringify(request.tools ?? []).length;
-    res.write(`data: ${JSON.stringify({ ...base, choices: [], usage: { prompt_tokens: Math.ceil(promptChars / 3.5), completion_tokens: 10, total_tokens: 0 } })}\n\n`);
+    res.write(
+      `data: ${JSON.stringify({ ...base, choices: [], usage: { prompt_tokens: Math.ceil(promptChars / 3.5), completion_tokens: 10, total_tokens: 0 } })}\n\n`,
+    );
     res.end("data: [DONE]\n\n");
   }
 }

@@ -1,28 +1,28 @@
 export {
   Agent,
-  defaultSystemPrompt,
-  parseArgs,
   type AgentEvents,
   type AgentOptions,
   type ApprovalRequest,
+  defaultSystemPrompt,
   type PermissionMode,
   type PermissionPolicy,
+  parseArgs,
   type RunResult,
   type StopReason,
   type ToolCallRecord,
 } from "./agent.ts";
-export * from "./tools/types.ts";
-export { fsTools, resolveInWorkspace } from "./tools/fs.ts";
-export { webTools, webSearchTool, webFetchTool, htmlToMarkdown, searchProviderName } from "./tools/web.ts";
 export {
-  createChatClient,
-  openAIChatClient,
   anthropicChatClient,
+  type ChatClient,
+  createChatClient,
+  type ModelEntry,
+  openAIChatClient,
   PROVIDERS,
   ProviderError,
-  type ChatClient,
-  type ModelEntry,
   type ProviderKind,
   type ProviderSettings,
 } from "./providers.ts";
-export { loadSettings, saveSettings, settingsPath, type SavedSettings } from "./settings.ts";
+export { loadSettings, type SavedSettings, saveSettings, settingsPath } from "./settings.ts";
+export { fsTools, resolveInWorkspace } from "./tools/fs.ts";
+export * from "./tools/types.ts";
+export { htmlToMarkdown, searchProviderName, webFetchTool, webSearchTool, webTools } from "./tools/web.ts";

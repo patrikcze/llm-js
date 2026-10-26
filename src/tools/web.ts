@@ -5,10 +5,9 @@ import { Readability } from "@mozilla/readability";
 import { parseHTML } from "linkedom";
 import TurndownService from "turndown";
 import { Agent, fetch as undiciFetch } from "undici";
-import { ToolError, truncate, type Tool, type ToolContext } from "./types.ts";
+import { type Tool, type ToolContext, ToolError, truncate } from "./types.ts";
 
-const USER_AGENT =
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
+const USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
 const FETCH_TIMEOUT_MS = 20_000;
 const MAX_BODY_BYTES = 5_000_000;
 const DEFAULT_FETCH_CHARS = 20_000;
@@ -24,14 +23,27 @@ const DEFAULT_FETCH_CHARS = 20_000;
 const BLOCKED_V4 = new BlockList();
 const BLOCKED_V6 = new BlockList();
 for (const [net, bits] of [
-  ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8], ["169.254.0.0", 16],
-  ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.0.2.0", 24], ["192.168.0.0", 16], ["198.18.0.0", 15],
-  ["198.51.100.0", 24], ["203.0.113.0", 24], ["224.0.0.0", 4], ["240.0.0.0", 4],
-] as const) BLOCKED_V4.addSubnet(net, bits, "ipv4");
+  ["0.0.0.0", 8],
+  ["10.0.0.0", 8],
+  ["100.64.0.0", 10],
+  ["127.0.0.0", 8],
+  ["169.254.0.0", 16],
+  ["172.16.0.0", 12],
+  ["192.0.0.0", 24],
+  ["192.0.2.0", 24],
+  ["192.168.0.0", 16],
+  ["198.18.0.0", 15],
+  ["198.51.100.0", 24],
+  ["203.0.113.0", 24],
+  ["224.0.0.0", 4],
+  ["240.0.0.0", 4],
+] as const)
+  BLOCKED_V4.addSubnet(net, bits, "ipv4");
 for (const [net, bits] of [
   ["::", 96], // unspecified, loopback and IPv4-compatible (::a.b.c.d)
   ["::ffff:0:0", 96], // IPv4-mapped
-  ["64:ff9b::", 96], ["64:ff9b:1::", 48], // NAT64: embeds an IPv4 address
+  ["64:ff9b::", 96],
+  ["64:ff9b:1::", 48], // NAT64: embeds an IPv4 address
   ["100::", 64], // discard
   ["2001:db8::", 32], // documentation
   ["2002::", 16], // 6to4: embeds an IPv4 address
@@ -39,7 +51,8 @@ for (const [net, bits] of [
   ["fe80::", 10], // link-local
   ["fec0::", 10], // site-local (deprecated)
   ["ff00::", 8], // multicast
-] as const) BLOCKED_V6.addSubnet(net, bits, "ipv6");
+] as const)
+  BLOCKED_V6.addSubnet(net, bits, "ipv6");
 
 export function isPrivateAddress(ip: string): boolean {
   const family = isIP(ip);
@@ -60,7 +73,9 @@ export const guardedLookup: LookupFunction = (hostname, options, callback) => {
     if (!privateFetchAllowed()) {
       const bad = list.find((a) => isPrivateAddress(a.address));
       if (bad) {
-        const e = Object.assign(new Error(`${hostname} resolves to a private/local address (${bad.address})`), { code: "ERR_PRIVATE_ADDRESS" });
+        const e = Object.assign(new Error(`${hostname} resolves to a private/local address (${bad.address})`), {
+          code: "ERR_PRIVATE_ADDRESS",
+        });
         return callback(e, "", 0);
       }
     }
@@ -91,7 +106,11 @@ async function assertPublicUrl(url: URL): Promise<void> {
 
 type FetchResponse = Awaited<ReturnType<typeof undiciFetch>>;
 
-async function safeFetch(rawUrl: string, ctx: ToolContext, init: { method?: string; headers?: Record<string, string>; body?: string } = {}): Promise<FetchResponse> {
+async function safeFetch(
+  rawUrl: string,
+  ctx: ToolContext,
+  init: { method?: string; headers?: Record<string, string>; body?: string } = {},
+): Promise<FetchResponse> {
   let url: URL;
   try {
     url = new URL(rawUrl);
@@ -153,14 +172,27 @@ async function readBody(res: FetchResponse): Promise<string> {
 
 const MAX_IMAGE_BYTES = 15_000_000;
 // Raster formats only: SVG can carry script and would run in the UI's origin if opened directly.
-const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/bmp", "image/x-icon", "image/vnd.microsoft.icon"]);
+const IMAGE_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  "image/avif",
+  "image/bmp",
+  "image/x-icon",
+  "image/vnd.microsoft.icon",
+]);
 
 /**
  * Fetches a remote image for the UI with the same guards as web_fetch (public addresses only,
  * pinned DNS, checked redirects). Returns the bytes and content type, or throws ToolError.
  */
 export async function fetchImage(rawUrl: string, signal: AbortSignal): Promise<{ type: string; body: Buffer }> {
-  const res = await safeFetch(rawUrl, { workspace: "", signal }, { headers: { Accept: "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8" } });
+  const res = await safeFetch(
+    rawUrl,
+    { workspace: "", signal },
+    { headers: { Accept: "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8" } },
+  );
   if (!res.ok) {
     await res.body?.cancel();
     throw new ToolError(`HTTP ${res.status} for image ${rawUrl}`);
@@ -223,7 +255,7 @@ export function htmlToMarkdown(html: string, url: string): { title: string; mark
 // web_fetch
 // ---------------------------------------------------------------------------
 
-export const webFetchTool: Tool<{ url: string; start_index?: number; max_length?: number }> = {
+export const webFetchTool: Tool<{ url: string; start_index?: number; max_length?: number }, string> = {
   name: "web_fetch",
   risk: "read",
   description:
@@ -234,12 +266,19 @@ export const webFetchTool: Tool<{ url: string; start_index?: number; max_length?
     properties: {
       url: { type: "string", description: "Absolute http(s) URL." },
       start_index: { type: "integer", minimum: 0, description: "Character offset to start from. Default 0." },
-      max_length: { type: "integer", minimum: 500, maximum: 100000, description: `Max characters to return. Default ${DEFAULT_FETCH_CHARS}.` },
+      max_length: {
+        type: "integer",
+        minimum: 500,
+        maximum: 100000,
+        description: `Max characters to return. Default ${DEFAULT_FETCH_CHARS}.`,
+      },
     },
     required: ["url"],
   },
   async run({ url, start_index = 0, max_length = DEFAULT_FETCH_CHARS }, ctx) {
-    const res = await safeFetch(url, ctx, { headers: { Accept: "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.5" } });
+    const res = await safeFetch(url, ctx, {
+      headers: { Accept: "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.5" },
+    });
     const type = (res.headers.get("content-type") ?? "").toLowerCase();
     if (!res.ok) {
       const body = await readBody(res).catch(() => "");
@@ -332,12 +371,11 @@ const searxng: SearchProvider = async (query, count, ctx) => {
         "Web search is unavailable: tell the user to run `npm run search:up`, and use web_fetch on known URLs meanwhile.",
     );
   }
-  if (res.status === 403) throw new ToolError("SearXNG refused the JSON API (HTTP 403). Add `json` to search.formats in searxng/settings.yml.");
+  if (res.status === 403)
+    throw new ToolError("SearXNG refused the JSON API (HTTP 403). Add `json` to search.formats in searxng/settings.yml.");
   if (!res.ok) throw new ToolError(`SearXNG search failed: HTTP ${res.status}.`);
   const data: any = await res.json();
-  return (data.results ?? [])
-    .slice(0, count)
-    .map((r: any) => ({ title: r.title, url: r.url, snippet: r.content ?? "" }));
+  return (data.results ?? []).slice(0, count).map((r: any) => ({ title: r.title, url: r.url, snippet: r.content ?? "" }));
 };
 
 /** Keyless fallback: scrapes DuckDuckGo's HTML endpoint. */
@@ -387,7 +425,7 @@ export function searchProviderName(): string {
 
 const providers: Record<string, SearchProvider> = { tavily, brave, searxng, duckduckgo };
 
-export const webSearchTool: Tool<{ query: string; count?: number }> = {
+export const webSearchTool: Tool<{ query: string; count?: number }, string> = {
   name: "web_search",
   risk: "read",
   description:

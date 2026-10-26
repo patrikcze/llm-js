@@ -88,10 +88,21 @@
   .badge b { font-size: 16px; color: var(--accent); font-weight: 500; line-height: 1.1; }
 
   select, button { font: inherit; font-size: 11px; letter-spacing: .16em; text-transform: uppercase; }
+  /* Closed control drawn in the HUD style; the opened menu stays the native OS menu. */
   select {
-    background: transparent; color: var(--accent); border: 1px solid var(--line); padding: 6px 8px; border-radius: 0;
+    -webkit-appearance: none; -moz-appearance: none; appearance: none;
+    height: 32px; min-width: 132px; padding: 0 34px 0 12px; border-radius: 0; cursor: pointer;
+    color: var(--accent); border: 1px solid var(--line-strong);
+    background-color: rgba(0, 0, 0, .25);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%238fe3cf' stroke-width='1.4'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 12px center; background-size: 10px 6px;
+    transition: background-color .15s, box-shadow .15s, border-color .15s;
   }
-  select option { background: var(--bg); color: var(--text); }
+  select:hover { background-color: rgba(143, 227, 207, .08); box-shadow: 0 0 14px var(--accent-glow); }
+  select:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
+  select::-ms-expand { display: none; }
+  /* Native menu items: normal case and system colours. */
+  select option { text-transform: none; letter-spacing: normal; }
   button {
     background: transparent; color: var(--accent); border: 1px solid var(--line-strong); padding: 7px 14px;
     cursor: pointer; position: relative; white-space: nowrap; transition: background .15s, box-shadow .15s, color .15s;
@@ -209,13 +220,46 @@
   .coil svg { width: 84px; height: 40px; flex: none; }
   .coil p { margin: 0; font-size: 8.5px; line-height: 1.5; letter-spacing: .1em; color: var(--dim); text-transform: uppercase; }
   #form { display: flex; gap: 10px; align-items: flex-end; max-width: 860px; width: 100%; margin: 0 auto; }
-  .prompt { flex: 1; display: flex; align-items: flex-start; border: 1px solid var(--line-strong); background: rgba(0,0,0,.25); padding: 8px 12px; gap: 10px; transition: box-shadow .2s; }
+  /* ›, the attach button and the first text line share one 24px line box, so they stay aligned
+     when the textarea grows to several lines. */
+  .prompt { flex: 1; display: flex; align-items: flex-start; border: 1px solid var(--line-strong); background: rgba(0,0,0,.25); padding: 8px 12px; gap: 8px; transition: box-shadow .2s; }
   .prompt:focus-within { box-shadow: 0 0 18px var(--accent-glow); }
-  .prompt::before { content: "›"; color: var(--accent); font-size: 16px; line-height: 1.4; }
+  .prompt::before { content: "›"; flex: none; color: var(--accent); font-size: 16px; height: 24px; line-height: 24px; }
   textarea:focus-visible { outline: none; }
-  textarea { flex: 1; resize: none; font: inherit; color: var(--text); background: transparent; border: 0; outline: 0; padding: 2px 0; min-height: 24px; max-height: 180px; }
+  textarea { flex: 1; resize: none; font: inherit; line-height: 20px; color: var(--text); background: transparent; border: 0; outline: 0; padding: 2px 0; min-height: 24px; max-height: 180px; }
   textarea::placeholder { color: var(--faint); text-transform: uppercase; letter-spacing: .14em; font-size: 11.5px; }
-  #form button { padding: 11px 18px; }
+  #form > button { padding: 11px 18px; }
+  .composer { position: relative; max-width: 860px; width: 100%; margin: 0 auto; min-width: 0; }
+  .attach-btn {
+    flex: none; width: 24px; height: 24px; padding: 0; border: 0; background: none; box-shadow: none !important;
+    color: var(--dim); display: grid; place-items: center; align-self: flex-start;
+  }
+  .attach-btn:hover { color: var(--accent); background: none; }
+  .attach-btn svg { width: 16px; height: 16px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 10px; margin: 0 0 10px; }
+  .chips:empty { display: none; }
+  .chip { position: relative; width: 58px; height: 58px; border: 1px solid var(--line-strong); background: rgba(0,0,0,.3); }
+  .chip img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .chip .kb { position: absolute; left: 0; right: 0; bottom: 0; font-size: 8.5px; text-align: center; background: rgba(0,0,0,.65); color: var(--dim); }
+  .chip button {
+    position: absolute; top: -8px; right: -8px; width: 18px; height: 18px; padding: 0; border-radius: 50%;
+    font-size: 11px; line-height: 16px; letter-spacing: 0; background: var(--bg);
+  }
+  .frame.dragging { box-shadow: inset 0 0 0 2px var(--accent), 0 0 40px var(--accent-glow); }
+  .user .thumbs { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  .user .thumbs img { max-height: 140px; max-width: 220px; border: 1px solid var(--line); display: block; }
+  .cmds {
+    position: absolute; left: 0; right: 0; bottom: calc(100% + 6px); z-index: 5; max-height: 280px; overflow: auto;
+    border: 1px solid var(--line-strong); background: #0d1717; box-shadow: 0 0 24px rgba(0,0,0,.6), 0 0 16px var(--accent-glow);
+  }
+  .cmds div { display: flex; gap: 14px; padding: 7px 12px; cursor: pointer; font-size: 12px; align-items: baseline; }
+  .cmds div[aria-selected="true"] { background: rgba(143,227,207,.1); }
+  .cmds b { color: var(--accent); font-weight: 500; min-width: 210px; white-space: nowrap; }
+  .cmds span { color: var(--dim); }
+  .sys { color: var(--dim); font-size: 11.5px; border-left: 2px solid var(--line); padding-left: 10px; white-space: pre-wrap; }
+  .sys b { color: var(--accent); font-weight: 500; }
+  .readout .row.toggle { cursor: pointer; }
+  .readout .row.toggle:hover .v { text-shadow: 0 0 8px var(--accent-glow); text-decoration: underline dotted; }
   .binary { font-size: 8.5px; letter-spacing: .12em; color: var(--dim); text-align: right; line-height: 1.5; display: flex; align-items: center; gap: 10px; }
   .binary svg { width: 34px; height: 34px; color: var(--accent); flex: none; }
   .hint { grid-column: 2; max-width: 860px; width: 100%; margin: 6px auto 0; font-size: 9.5px; letter-spacing: .18em; color: var(--faint); text-transform: uppercase; }
@@ -386,6 +430,8 @@
       <div class="row"><span>Model</span><span class="dots"></span><span class="v" id="r-model">—</span></div>
       <div class="row"><span>Search</span><span class="dots"></span><span class="v" id="r-search">—</span></div>
       <div class="row"><span>Auth</span><span class="dots"></span><span class="v" id="r-mode">—</span></div>
+      <div class="row toggle" id="t-think" title="Click to cycle auto → on → off (or /think)"><span>Thinking</span><span class="dots"></span><span class="v" id="r-think">—</span></div>
+      <div class="row toggle" id="t-stream" title="Click to toggle (or /stream)"><span>Stream</span><span class="dots"></span><span class="v" id="r-stream">—</span></div>
       <div class="row"><span>Rules</span><span class="dots"></span><span class="v" id="r-agents">—</span></div>
     </div>
     <div class="readout">
@@ -426,14 +472,24 @@
       </svg>
       <p>Welcome aboard, operator. The agent reads, writes and browses on your behalf. Every write is logged; destructive actions need your authorization.</p>
     </div>
+    <div class="composer">
+    <div class="cmds" id="cmds" role="listbox" aria-label="Commands" hidden></div>
+    <div class="chips" id="chips" aria-label="Attached images"></div>
     <form id="form">
-      <div class="prompt"><textarea id="input" rows="1" placeholder="Enter directive…" autofocus></textarea></div>
+      <div class="prompt">
+        <button type="button" class="attach-btn" id="attach" title="Attach images (or paste / drop them)" aria-label="Attach images">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M20 11.5l-7.8 7.8a5 5 0 0 1-7.1-7.1l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7l-8.5 8.5a1.7 1.7 0 0 1-2.4-2.4l7.8-7.8"/></svg>
+        </button>
+        <textarea id="input" rows="1" placeholder="Enter directive… ( / for commands )" autofocus></textarea>
+      </div>
+      <input type="file" id="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
       <button class="solid" id="send" type="submit">Transmit</button>
     </form>
+    </div>
     <div class="binary" aria-hidden="true"><span id="binary"></span>
       <svg viewBox="-20 -20 40 40" fill="none" stroke="currentColor" stroke-width="1"><circle r="17"/><ellipse rx="7" ry="17"/><path d="M-17 0H17M-15 -8H15M-15 8H15"/></svg>
     </div>
-    <div class="hint">Enter: transmit · Shift+Enter: new line · Abort cancels the running task</div>
+    <div class="hint">Enter: transmit · Shift+Enter: new line · / commands · paste or drop images</div>
   </footer>
 </div>
 
@@ -787,15 +843,19 @@ function showInfo(i) {
   $("r-model").textContent = i.model ? i.model.split("/").pop() : "none";
   $("r-model").title = i.model;
   $("r-search").textContent = i.search;
+  currentInfo = i;
   $("r-mode").textContent = i.mode;
+  $("r-think").textContent = i.thinking ?? "auto";
+  $("r-stream").textContent = i.stream === false ? "off" : "on";
   $("r-agents").textContent = i.agentsMd ? "agents.md" : "default";
   $("r-tokens").textContent = `~${i.tokens.toLocaleString()} / ${ctxMax.toLocaleString()}`;
   $("r-bar").style.width = Math.min(100, (i.tokens / ctxMax) * 100) + "%";
   $("r-ws").textContent = i.workspace;
   $("r-tools").replaceChildren(...i.tools.map((t) => Object.assign(el("span", t.risk, t.name), { title: "risk: " + t.risk })));
   $("tab-left").textContent = "NAV.SYS " + (i.model.split("/").pop() || "OFFLINE").toUpperCase().slice(0, 22);
-  $("tab-right").textContent = "— " + i.mode.toUpperCase();
-  if (!modeSel.options.length) for (const m of i.modes) modeSel.append(new Option(m, m));
+  $("tab-right").textContent = `— ${i.mode.toUpperCase()} · THINK ${(i.thinking ?? "auto").toUpperCase()}`;
+  const MODE_LABELS = { "read-only": "Read-only", ask: "Ask first", "auto-edit": "Auto-edit", auto: "Full auto" };
+  if (!modeSel.options.length) for (const m of i.modes) modeSel.append(new Option(MODE_LABELS[m] ?? m, m));
   modeSel.value = i.mode;
 }
 function showResult(r) {
@@ -808,10 +868,16 @@ function showResult(r) {
 const refreshInfo = () => fetch("/api/info").then((r) => r.json()).then(showInfo);
 
 // ---------------------------------------------------------------- one run
-async function run(message_) {
+async function run(message_, images = []) {
   busy = true;
   sendBtn.textContent = "Abort"; sendBtn.classList.replace("solid", "danger");
-  const [u, ub] = message("user", "› Operator"); ub.textContent = message_; add(u);
+  const [u, ub] = message("user", "› Operator"); ub.textContent = message_;
+  if (images.length) {
+    const thumbs = el("div", "thumbs");
+    for (const img of images) { const im = el("img"); im.src = img.url; im.alt = img.name; im.title = `${img.name} · ${img.w}×${img.h}`; thumbs.append(im); }
+    ub.append(thumbs);
+  }
+  add(u);
   log.append(working); status("Uplink · awaiting model"); stick();
 
   let textBody = null, textBuf = "", thinkBlock = null, frame = 0, steps = 0, sawText = false;
@@ -855,7 +921,7 @@ async function run(message_) {
       const t = tools.get(r.id);
       if (!t) return;
       t.st.className = "status " + r.status;
-      t.st.textContent = (r.status === "ok" ? "OK" : r.status === "denied" ? "DENIED" : "FAULT") + " · " + r.ms + "MS";
+      t.st.textContent = (r.status === "ok" ? "OK" : r.status === "denied" ? "DENIED" : "FAULT") + " · " + r.ms + "MS" + (r.images ? ` · ${r.images} IMG` : "");
       t.body.append(el("pre", "", r.output));
       status("Processing results");
     },
@@ -897,7 +963,7 @@ async function run(message_) {
   };
 
   try {
-    const res = await fetch("/api/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ message: message_ }) });
+    const res = await fetch("/api/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ message: message_, images: images.map((i) => i.url) }) });
     if (!res.ok) { handlers.error({ message: (await res.json()).error }); return; }
     // Parse the SSE stream by hand (EventSource cannot POST).
     const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
@@ -1062,18 +1128,177 @@ syncImagePref();
 $("open-config").onclick = openConfig;
 $("sub").onclick = openConfig;
 
+// ---------------------------------------------------------------- image attachments
+// Images are re-encoded in the browser when needed: at most 1568 px per side (what vision models
+// actually use) and PNG/JPEG only, since llama.cpp cannot decode WebP.
+const pending = [];
+const MAX_SIDE = 1568, MAX_BYTES = 1_500_000, MAX_IMAGES = 8;
+const readAsDataURL = (blob) => new Promise((resolve, reject) => {
+  const fr = new FileReader();
+  fr.onload = () => resolve(fr.result); fr.onerror = () => reject(fr.error); fr.readAsDataURL(blob);
+});
+async function prepareImage(file) {
+  if (!/^image\/(png|jpeg|gif|webp)$/.test(file.type)) throw new Error("only PNG, JPEG, GIF or WebP");
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, MAX_SIDE / Math.max(bitmap.width, bitmap.height));
+  const w = Math.round(bitmap.width * scale), h = Math.round(bitmap.height * scale);
+  if (scale === 1 && file.size <= MAX_BYTES && /png|jpeg/.test(file.type)) return { url: await readAsDataURL(file), w, h };
+  const canvas = document.createElement("canvas");
+  canvas.width = w; canvas.height = h;
+  canvas.getContext("2d").drawImage(bitmap, 0, 0, w, h);
+  let blob = await new Promise((r) => canvas.toBlob(r, "image/png"));
+  if (blob.size > MAX_BYTES) blob = await new Promise((r) => canvas.toBlob(r, "image/jpeg", 0.86));
+  return { url: await readAsDataURL(blob), w, h };
+}
+async function addFiles(files) {
+  for (const f of files) {
+    if (!f.type.startsWith("image/")) continue;
+    if (pending.length >= MAX_IMAGES) { sysLine(`At most ${MAX_IMAGES} images per message.`); break; }
+    try {
+      const img = await prepareImage(f);
+      pending.push({ ...img, name: f.name || "pasted image", kb: Math.ceil((img.url.length * 0.75) / 1024) });
+    } catch (e) {
+      sysLine(`Could not attach ${f.name || "the image"}: ${e.message}`);
+    }
+  }
+  renderChips();
+}
+function renderChips() {
+  $("chips").replaceChildren(...pending.map((p, i) => {
+    const chip = el("div", "chip");
+    chip.title = `${p.name} · ${p.w}×${p.h} · ${p.kb} KB`;
+    const im = el("img"); im.src = p.url; im.alt = p.name;
+    const x = el("button", "", "×"); x.type = "button"; x.setAttribute("aria-label", `Remove ${p.name}`);
+    x.onclick = () => { pending.splice(i, 1); renderChips(); input.focus(); };
+    chip.append(im, el("span", "kb", `${p.kb} KB`), x);
+    return chip;
+  }));
+}
+$("attach").onclick = () => $("file").click();
+$("file").onchange = async () => { await addFiles([...$("file").files]); $("file").value = ""; input.focus(); };
+input.addEventListener("paste", (e) => {
+  const files = [...(e.clipboardData?.files ?? [])].filter((f) => f.type.startsWith("image/"));
+  if (files.length) { e.preventDefault(); addFiles(files); }
+});
+const frameEl = document.querySelector(".frame");
+let dragDepth = 0;
+const hasFiles = (e) => [...(e.dataTransfer?.types ?? [])].includes("Files");
+frameEl.addEventListener("dragenter", (e) => { if (hasFiles(e)) { dragDepth++; frameEl.classList.add("dragging"); } });
+frameEl.addEventListener("dragleave", () => { if (--dragDepth <= 0) { dragDepth = 0; frameEl.classList.remove("dragging"); } });
+frameEl.addEventListener("dragover", (e) => { if (hasFiles(e)) e.preventDefault(); });
+frameEl.addEventListener("drop", (e) => {
+  if (!hasFiles(e)) return;
+  e.preventDefault(); dragDepth = 0; frameEl.classList.remove("dragging");
+  addFiles([...e.dataTransfer.files]);
+});
+
+// ---------------------------------------------------------------- slash commands
+let currentInfo = {};
+function sysLine(text) { add(el("div", "sys", text)); }
+const COMMANDS = [
+  { name: "/think", args: ["auto", "on", "off"], help: "Reasoning: model decides · force on · off (much faster)" },
+  { name: "/stream", args: ["on", "off"], help: "Stream tokens live, or wait for whole replies" },
+  { name: "/mode", args: ["read-only", "ask", "auto-edit", "auto"], help: "Permission mode for writes and deletes" },
+  { name: "/model", args: [], help: "Open the provider and model picker" },
+  { name: "/attach", args: [], help: "Attach images (you can also paste or drop them)" },
+  { name: "/reset", args: [], help: "Start a new session" },
+  { name: "/help", args: [], help: "List commands" },
+];
+async function handleCommand(line) {
+  const [cmd, ...rest] = line.trim().split(/\s+/);
+  const arg = rest.join(" ").toLowerCase();
+  const spec = COMMANDS.find((c) => c.name === cmd.toLowerCase());
+  if (!spec) return sysLine(`Unknown command ${cmd}. Type /help.`);
+  if (arg && spec.args.length && !spec.args.includes(arg)) return sysLine(`Usage: ${spec.name} ${spec.args.join("|")}`);
+  switch (spec.name) {
+    case "/think": {
+      if (arg) showInfo(await api("/api/options", { thinking: arg }));
+      const note = currentInfo.provider === "anthropic" && currentInfo.thinking === "off" && /opus-5|fable|mythos/.test(currentInfo.model)
+        ? " (this model cannot turn thinking off; it runs at low effort instead)" : "";
+      return sysLine(`Thinking: ${currentInfo.thinking}${note}`);
+    }
+    case "/stream":
+      if (arg) showInfo(await api("/api/options", { stream: arg === "on" }));
+      return sysLine(`Streaming: ${currentInfo.stream ? "on" : "off"}`);
+    case "/mode":
+      if (arg) showInfo(await api("/api/mode", { mode: arg }));
+      return sysLine(`Mode: ${currentInfo.mode}`);
+    case "/model": return openConfig();
+    case "/attach": return $("file").click();
+    case "/reset": return $("reset").click();
+    case "/help":
+      return sysLine(COMMANDS.map((c) => `${(c.name + (c.args.length ? ` ${c.args.join("|")}` : "")).padEnd(38)} ${c.help}`).join("\n"));
+  }
+}
+$("t-think").onclick = async () => {
+  const order = ["auto", "on", "off"];
+  showInfo(await api("/api/options", { thinking: order[(order.indexOf(currentInfo.thinking) + 1) % 3] }));
+};
+$("t-stream").onclick = async () => showInfo(await api("/api/options", { stream: !currentInfo.stream }));
+
+// Command palette: suggestions while the input starts with "/".
+const palette = $("cmds");
+let palItems = [], palIdx = 0;
+function hidePalette() { palette.hidden = true; palItems = []; }
+function updatePalette() {
+  const v = input.value;
+  if (!v.startsWith("/") || v.includes("\n")) return hidePalette();
+  const [word, ...rest] = v.split(" ");
+  if (!rest.length) {
+    palItems = COMMANDS.filter((c) => c.name.startsWith(word.toLowerCase()))
+      .map((c) => ({ label: c.name + (c.args.length ? ` <${c.args.join("|")}>` : ""), help: c.help, fill: c.args.length ? `${c.name} ` : c.name }));
+  } else {
+    const spec = COMMANDS.find((c) => c.name === word.toLowerCase());
+    const typed = rest.join(" ").toLowerCase();
+    palItems = (spec?.args ?? []).filter((a) => a.startsWith(typed)).map((a) => ({ label: `${spec.name} ${a}`, help: "", fill: `${spec.name} ${a}` }));
+  }
+  if (!palItems.length) return hidePalette();
+  palIdx = Math.min(palIdx, palItems.length - 1);
+  palette.replaceChildren(...palItems.map((item, i) => {
+    const row = el("div");
+    row.setAttribute("role", "option");
+    row.setAttribute("aria-selected", String(i === palIdx));
+    row.append(el("b", "", item.label), el("span", "", item.help));
+    row.onmousedown = (e) => { e.preventDefault(); acceptPalette(i); };
+    return row;
+  }));
+  palette.hidden = false;
+}
+function acceptPalette(i = palIdx) {
+  input.value = palItems[i].fill;
+  palIdx = 0;
+  input.focus();
+  updatePalette();
+}
+
 // ---------------------------------------------------------------- wiring
 $("form").onsubmit = (e) => {
   e.preventDefault();
-  if (busy) { status("Aborting"); api("/api/cancel"); return; }
+  hidePalette();
   const msg = input.value.trim();
-  if (!msg) return;
+  if (msg.startsWith("/")) { input.value = ""; input.style.height = ""; handleCommand(msg); return; }
+  if (busy) { status("Aborting"); api("/api/cancel"); return; }
+  if (!msg && !pending.length) return;
+  const images = pending.splice(0);
+  renderChips();
   input.value = ""; input.style.height = "";
-  run(msg);
+  run(msg, images);
 };
 input.addEventListener("keydown", (e) => {
+  if (!palette.hidden && palItems.length) {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      palIdx = (palIdx + (e.key === "ArrowDown" ? 1 : palItems.length - 1)) % palItems.length;
+      return updatePalette();
+    }
+    if (e.key === "Tab") { e.preventDefault(); return acceptPalette(); }
+    if (e.key === "Escape") { e.preventDefault(); return hidePalette(); }
+    if (e.key === "Enter" && !e.shiftKey && palItems[palIdx].fill.trim() !== input.value.trim()) { e.preventDefault(); return acceptPalette(); }
+  }
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("form").requestSubmit(); }
 });
+input.addEventListener("input", updatePalette);
+input.addEventListener("blur", () => setTimeout(hidePalette, 120));
 input.addEventListener("input", () => { input.style.height = ""; input.style.height = Math.min(input.scrollHeight, 180) + "px"; });
 modeSel.onchange = async () => showInfo(await api("/api/mode", { mode: modeSel.value }));
 $("reset").onclick = async () => {

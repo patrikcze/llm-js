@@ -34,7 +34,7 @@ export function saveSettings(s: SavedSettings): void {
   const file = settingsPath();
   mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(s, null, 2) + "\n", { mode: 0o600 });
+  writeFileSync(tmp, `${JSON.stringify(s, null, 2)}\n`, { mode: 0o600 });
   renameSync(tmp, file);
   chmodSync(file, 0o600);
 }

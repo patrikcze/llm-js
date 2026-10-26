@@ -3,20 +3,23 @@ import os from "node:os";
 import type OpenAI from "openai";
 import type {
   ChatCompletionAssistantMessageParam,
+  ChatCompletionContentPart,
   ChatCompletionMessageFunctionToolCall,
   ChatCompletionMessageParam,
   ChatCompletionToolMessageParam,
 } from "openai/resources/chat/completions";
-import { openAIChatClient, type ChatClient } from "./providers.ts";
+import { type ChatClient, openAIChatClient, type ProviderState, type ThinkingMode } from "./providers.ts";
 import {
+  type ActionDescription,
   assertValidTool,
   coerceArgs,
-  toOpenAITool,
-  ToolError,
-  validateArgs,
-  type ActionDescription,
+  type ImageData,
   type Tool,
+  ToolError,
+  type ToolOutput,
   type ToolRisk,
+  toOpenAITool,
+  validateArgs,
 } from "./tools/types.ts";
 
 // ===========================================================================
@@ -78,7 +81,12 @@ export interface ToolCallRecord {
   /** ok: ran; error: tool/validation failure; denied: blocked by policy or human. */
   status: "ok" | "error" | "denied";
   ms: number;
+  /** Number of images the tool showed to the model. */
+  images?: number;
 }
+
+/** A user message: plain text, or text plus images (OpenAI content parts, e.g. data: URLs). */
+export type UserInput = string | ChatCompletionContentPart[];
 
 export interface RunResult {
   text: string;
@@ -124,6 +132,10 @@ export interface AgentOptions {
   /** Max tokens the model may generate per round. Default 4096. */
   maxOutputTokens?: number;
   temperature?: number;
+  /** Reasoning: "auto" leaves it to the model; "on"/"off" map to each provider's switch. Default "auto". */
+  thinking?: ThinkingMode;
+  /** Stream tokens as they are generated. Default true; turn off for servers that mangle streamed tool calls. */
+  stream?: boolean;
   /** Max characters of a single tool result kept in the conversation. Default 24000. */
   maxToolResultChars?: number;
   /** Per tool call. Default 120000. */
@@ -136,13 +148,15 @@ type ToolCall = ChatCompletionMessageFunctionToolCall;
 // Rules given to the model
 // ===========================================================================
 
+const POLICY_TEXT: Record<PermissionMode, string> = {
+  "read-only": "You may only read. Write and delete tools will be refused; describe the changes instead.",
+  ask: "Every write or delete is shown to the user for approval before it runs.",
+  "auto-edit": "Writes run immediately; deletes need the user's approval.",
+  auto: "All actions run immediately without approval, so be careful.",
+};
+
 export function defaultSystemPrompt(workspace: string, tools: Tool[], policy: PermissionPolicy): string {
-  const policyText: Record<PermissionMode, string> = {
-    "read-only": "You may only read. Write and delete tools will be refused; describe the changes instead.",
-    ask: "Every write or delete is shown to the user for approval before it runs.",
-    "auto-edit": "Writes run immediately; deletes need the user's approval.",
-    auto: "All actions run immediately without approval, so be careful.",
-  };
+  const policyText = POLICY_TEXT;
   return `You are an autonomous assistant that completes tasks by calling tools. You work in a loop:
 think, call tools, read their results, and continue until the task is done.
 
@@ -173,14 +187,26 @@ think, call tools, read their results, and continue until the task is done.
 
 const ELIDED = "[older tool output removed to save context]";
 const REPEAT_LIMIT = 3;
+/** Rough per-image cost; real values range from ~250 (Gemma) to ~1600 (Claude) tokens. */
+const IMAGE_TOKENS = 1200;
+/** JSON.stringify replacer that leaves base64 image data out of size estimates. */
+const withoutData = (_key: string, value: unknown) => (typeof value === "string" && value.startsWith("data:") ? "" : value);
+
+interface ExecResult {
+  record: ToolCallRecord;
+  images?: ImageData[];
+}
 
 export class Agent {
   readonly messages: ChatCompletionMessageParam[] = [];
-  private readonly opts: Required<
-    Omit<AgentOptions, "events" | "temperature" | "systemPrompt" | "instructions" | "client">
-  > & Pick<AgentOptions, "events" | "temperature">;
+  private readonly opts: Required<Omit<AgentOptions, "events" | "temperature" | "systemPrompt" | "instructions" | "client">> &
+    Pick<AgentOptions, "events" | "temperature">;
   private chat: ChatClient;
   private readonly toolsByName = new Map<string, Tool>();
+  /** User messages the agent adds itself (tool images); they do not start a new turn. */
+  private readonly synthetic = new WeakSet<object>();
+  /** Notes for the model, delivered with the next user message (keeps history append-only). */
+  private readonly pendingNotes: string[] = [];
   private readonly customSystemPrompt?: string;
   private readonly instructions?: string;
   /** Learned from the server's usage reports; starts with a conservative guess. */
@@ -200,6 +226,8 @@ export class Agent {
       maxOutputTokens: 4096,
       maxToolResultChars: 24_000,
       toolTimeoutMs: 120_000,
+      thinking: "auto",
+      stream: true,
       // Options passed as undefined must not erase the defaults.
       ...(Object.fromEntries(Object.entries(options).filter(([, v]) => v !== undefined)) as AgentOptions),
       // Symlinked paths (macOS /var -> /private/var) would otherwise confuse the sandbox checks.
@@ -249,23 +277,48 @@ export class Agent {
   /** Changes the policy for later tool calls and tells the model about it. */
   setPermissionMode(mode: PermissionMode): void {
     this.opts.permissions = { ...this.opts.permissions, mode };
-    this.messages[0] = { role: "system", content: this.buildSystemPrompt() };
+    if (this.messages.length === 1) {
+      this.messages[0] = { role: "system", content: this.buildSystemPrompt() };
+      return;
+    }
+    // Mid-conversation the system prompt stays byte-identical: prompt caches depend on it, and
+    // Claude's signed thinking blocks are bound to it. The model hears about it with the next message.
+    this.pendingNotes.push(`[Permission mode changed to "${mode}": ${POLICY_TEXT[mode]}]`);
+  }
+
+  get thinking(): ThinkingMode {
+    return this.opts.thinking;
+  }
+
+  /** "auto" | "on" | "off"; applies from the next model request. */
+  setThinking(mode: ThinkingMode): void {
+    this.opts.thinking = mode;
+  }
+
+  get streaming(): boolean {
+    return this.opts.stream;
+  }
+
+  setStreaming(on: boolean): void {
+    this.opts.stream = on;
   }
 
   get tools(): Tool[] {
     return [...this.toolsByName.values()];
   }
 
-  /** Clears the conversation but keeps the system prompt. */
+  /** Clears the conversation (the system prompt is rebuilt for the current settings). */
   reset(): void {
     this.messages.splice(1);
+    this.pendingNotes.length = 0;
+    this.messages[0] = { role: "system", content: this.buildSystemPrompt() };
   }
 
   /**
    * Runs the loop for one user message: call the model, run the tools it asks for,
    * feed results back, repeat until it answers without tools.
    */
-  async run(input: string, signal: AbortSignal = new AbortController().signal): Promise<RunResult> {
+  async run(input: UserInput, signal: AbortSignal = new AbortController().signal): Promise<RunResult> {
     const result: RunResult = {
       text: "",
       stopReason: "completed",
@@ -274,15 +327,22 @@ export class Agent {
       usage: { promptTokens: 0, completionTokens: 0 },
     };
     const seen = new Map<string, number>();
-    this.messages.push({ role: "user", content: input });
+    const notes = this.pendingNotes.splice(0).join("\n");
+    let content: UserInput = input;
+    if (notes) content = typeof input === "string" ? `${notes}\n\n${input}` : [{ type: "text", text: notes }, ...input];
+    this.messages.push({ role: "user", content });
 
     try {
       for (let step = 1; step <= this.opts.maxSteps; step++) {
         result.steps = step;
         const reply = await this.callModel(step, signal, result);
 
-        const assistant: ChatCompletionAssistantMessageParam = { role: "assistant", content: reply.content || null };
+        const assistant: ChatCompletionAssistantMessageParam & { provider_state?: ProviderState } = {
+          role: "assistant",
+          content: reply.content || null,
+        };
         if (reply.toolCalls.length) assistant.tool_calls = reply.toolCalls;
+        if (reply.providerState) assistant.provider_state = reply.providerState;
         this.messages.push(assistant);
 
         if (reply.toolCalls.length === 0) {
@@ -292,9 +352,10 @@ export class Agent {
           return result;
         }
 
-        const records = await this.executeToolCalls(reply.toolCalls, signal, seen);
-        result.toolCalls.push(...records);
-        for (const r of records) this.messages.push({ role: "tool", tool_call_id: r.id, content: r.output });
+        const executed = await this.executeToolCalls(reply.toolCalls, signal, seen);
+        result.toolCalls.push(...executed.map((e) => e.record));
+        for (const { record } of executed) this.messages.push({ role: "tool", tool_call_id: record.id, content: record.output });
+        this.showToolImages(executed);
         if (signal.aborted) throw signal.reason ?? new Error("aborted");
       }
 
@@ -316,6 +377,24 @@ export class Agent {
     }
   }
 
+  /**
+   * Tool messages carry text only (in the OpenAI format), so images a tool returns are shown in a
+   * user message right after the tool results. It is marked synthetic: not a new turn.
+   */
+  private showToolImages(executed: ExecResult[]): void {
+    const withImages = executed.filter((e) => e.images?.length);
+    if (!withImages.length) return;
+    const parts: ChatCompletionContentPart[] = [
+      { type: "text", text: `[Images returned by ${withImages.map((e) => e.record.name).join(", ")}]` },
+    ];
+    for (const e of withImages) {
+      for (const img of e.images!) parts.push({ type: "image_url", image_url: { url: `data:${img.mime};base64,${img.data}` } });
+    }
+    const message = { role: "user" as const, content: parts };
+    this.synthetic.add(message);
+    this.messages.push(message);
+  }
+
   /** Leaves the transcript sendable after an interrupted round. */
   private repairAfterCancel(): void {
     const last = this.messages.at(-1)!;
@@ -333,27 +412,30 @@ export class Agent {
 
   private async callModel(step: number, signal: AbortSignal, result: RunResult, { noTools = false } = {}) {
     const ev = this.opts.events ?? {};
-    for (let attempt = 0; ; attempt++) {
+    let squeeze = 0;
+    let visionRetried = false;
+    for (;;) {
       // Each overflow retry squeezes the conversation harder.
-      this.compact(attempt === 0 ? 1 : 0.6 / attempt);
+      this.compact(squeeze === 0 ? 1 : 0.6 / squeeze);
       const sentChars = this.estimateChars();
+      const sentImages = this.countImages();
       try {
         const stream = await this.chat.streamChat(
           {
             model: this.opts.model,
             messages: this.messages,
-            ...(noTools
-              ? {}
-              : { tools: this.tools.map(toOpenAITool), tool_choice: "auto" as const, parallel_tool_calls: true }),
+            ...(noTools ? {} : { tools: this.tools.map(toOpenAITool), tool_choice: "auto" as const, parallel_tool_calls: true }),
             max_tokens: this.opts.maxOutputTokens,
             temperature: this.opts.temperature,
-            stream: true,
-            stream_options: { include_usage: true },
+            thinking: this.opts.thinking,
+            stream: this.opts.stream,
+            ...(this.opts.stream ? { stream_options: { include_usage: true } } : {}),
           },
           signal,
         );
 
         let content = "";
+        let providerState: ProviderState | undefined;
         let finishReason: string | null = null;
         let usage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
         const calls: { id: string; name: string; args: string }[] = [];
@@ -363,7 +445,12 @@ export class Agent {
           const choice = chunk.choices?.[0];
           if (!choice) continue;
           if (choice.finish_reason) finishReason = choice.finish_reason;
-          const delta = choice.delta as typeof choice.delta & { reasoning_content?: string; reasoning?: string };
+          const delta = choice.delta as typeof choice.delta & {
+            reasoning_content?: string;
+            reasoning?: string;
+            provider_state?: ProviderState;
+          };
+          if (delta.provider_state) providerState = delta.provider_state;
           const reasoning = delta.reasoning_content ?? delta.reasoning;
           if (reasoning) ev.onReasoning?.(reasoning);
           if (delta.content) {
@@ -371,7 +458,9 @@ export class Agent {
             ev.onText?.(delta.content);
           }
           for (const tc of delta.tool_calls ?? []) {
-            const slot = (calls[tc.index ?? calls.length] ??= { id: "", name: "", args: "" });
+            const index = tc.index ?? calls.length;
+            calls[index] ??= { id: "", name: "", args: "" };
+            const slot = calls[index];
             if (tc.id) slot.id = tc.id;
             if (tc.function?.name) slot.name += tc.function.name;
             if (tc.function?.arguments) slot.args += tc.function.arguments;
@@ -384,8 +473,9 @@ export class Agent {
         if (usage?.prompt_tokens) {
           result.usage.promptTokens += usage.prompt_tokens;
           result.usage.completionTokens += usage.completion_tokens ?? 0;
-          // Calibrate the chars/token ratio against what the server actually counted.
-          const ratio = sentChars / usage.prompt_tokens;
+          // Calibrate the chars/token ratio against what the server counted (minus the images' share).
+          const textTokens = usage.prompt_tokens - sentImages * IMAGE_TOKENS;
+          const ratio = textTokens > 0 ? sentChars / textTokens : 0;
           if (ratio > 1 && ratio < 8) this.charsPerToken = this.charsPerToken * 0.5 + ratio * 0.5;
         }
         ev.onStep?.({ step, promptTokens: usage?.prompt_tokens, completionTokens: usage?.completion_tokens });
@@ -397,9 +487,16 @@ export class Agent {
             type: "function",
             function: { name: c.name, arguments: c.args || "{}" },
           }));
-        return { content: content.trim(), toolCalls, finishReason };
+        return { content: content.trim(), toolCalls, finishReason, providerState };
       } catch (err: any) {
-        if (!signal.aborted && isContextOverflow(err) && attempt < 3) {
+        if (!signal.aborted && !visionRetried && sentImages > 0 && isImageRejected(err)) {
+          visionRetried = true;
+          this.dropImages(this.messages.length, "[image omitted: the current model did not accept it]");
+          ev.onNotice?.("The model rejected image input (no vision support?); images were removed and the request retried.");
+          continue;
+        }
+        if (!signal.aborted && isContextOverflow(err) && squeeze < 3) {
+          squeeze++;
           ev.onNotice?.("Context window exceeded; compacting the conversation and retrying.");
           this.charsPerToken = Math.max(1.5, this.charsPerToken * 0.8);
           continue;
@@ -413,12 +510,14 @@ export class Agent {
   // Tool execution
   // -------------------------------------------------------------------------
 
-  private async executeToolCalls(calls: ToolCall[], signal: AbortSignal, seen: Map<string, number>): Promise<ToolCallRecord[]> {
-    const records = new Array<ToolCallRecord>(calls.length);
+  private async executeToolCalls(calls: ToolCall[], signal: AbortSignal, seen: Map<string, number>): Promise<ExecResult[]> {
+    const records = new Array<ExecResult>(calls.length);
     // Read tools run in parallel. Anything that may need approval runs one at a time, in order.
     const parallel: number[] = [];
     const serial: number[] = [];
-    calls.forEach((c, i) => ((this.toolsByName.get(c.function.name)?.risk ?? "read") === "read" ? parallel : serial).push(i));
+    for (const [i, c] of calls.entries()) {
+      ((this.toolsByName.get(c.function.name)?.risk ?? "read") === "read" ? parallel : serial).push(i);
+    }
 
     const runOne = async (i: number) => {
       records[i] = await this.executeToolCall(calls[i]!, signal, seen);
@@ -428,21 +527,24 @@ export class Agent {
     return records;
   }
 
-  private async executeToolCall(call: ToolCall, signal: AbortSignal, seen: Map<string, number>): Promise<ToolCallRecord> {
+  private async executeToolCall(call: ToolCall, signal: AbortSignal, seen: Map<string, number>): Promise<ExecResult> {
     const ev = this.opts.events ?? {};
     const { name } = call.function;
     const started = Date.now();
     let args: unknown = call.function.arguments;
 
-    const finish = (status: ToolCallRecord["status"], output: string): ToolCallRecord => {
+    const finish = (status: ToolCallRecord["status"], out: string | ToolOutput): ExecResult => {
+      const images = typeof out === "string" ? undefined : out.images?.filter((i) => i?.data);
+      let output = typeof out === "string" ? out : String(out.text ?? "");
       // A single result may use at most ~30% of the context window.
       const max = Math.min(this.opts.maxToolResultChars, Math.floor(this.opts.contextTokens * 0.3 * this.charsPerToken));
-      if (output.length > max) output = output.slice(0, max) + `\n[... output truncated at ${max} chars]`;
+      if (output.length > max) output = `${output.slice(0, max)}\n[... output truncated at ${max} chars]`;
       if (status === "error") output = `Error: ${output}`;
       if (status === "denied") output = `Denied: ${output}`;
       const record: ToolCallRecord = { id: call.id, name, args, output, status, ms: Date.now() - started };
+      if (images?.length) record.images = images.length;
       ev.onToolResult?.(record);
-      return record;
+      return { record, images: status === "ok" ? images : undefined };
     };
 
     if (signal.aborted) return finish("error", "Cancelled by the user.");
@@ -516,13 +618,34 @@ export class Agent {
 
   private estimateChars(): number {
     let n = JSON.stringify(this.tools.map(toOpenAITool)).length;
-    for (const m of this.messages) n += JSON.stringify(m).length;
+    for (const m of this.messages) n += JSON.stringify(m, withoutData).length;
     return n;
   }
 
-  estimateTokens(): number {
-    return Math.ceil(this.estimateChars() / this.charsPerToken);
+  private countImages(upTo = this.messages.length): number {
+    let n = 0;
+    for (const m of this.messages.slice(0, upTo)) {
+      if (Array.isArray(m.content)) n += (m.content as { type: string }[]).filter((p) => p.type === "image_url").length;
+    }
+    return n;
   }
+
+  /** Replaces image parts in messages before index `upTo` with a text placeholder. */
+  private dropImages(upTo: number, placeholder: string): void {
+    for (const m of this.messages.slice(0, upTo)) {
+      if (m.role !== "user" || !Array.isArray(m.content)) continue;
+      m.content = (m.content as ChatCompletionContentPart[]).map((p) =>
+        p.type === "image_url" ? { type: "text" as const, text: placeholder } : p,
+      );
+    }
+  }
+
+  /** Text tokens (calibrated chars/token) plus a fixed estimate per image. */
+  estimateTokens(): number {
+    return Math.ceil(this.estimateChars() / this.charsPerToken) + this.countImages() * IMAGE_TOKENS;
+  }
+
+  private isTurnStart = (m: ChatCompletionMessageParam) => m.role === "user" && !this.synthetic.has(m);
 
   /**
    * Keeps the conversation inside the context window: first shrinks old tool outputs,
@@ -534,8 +657,10 @@ export class Agent {
     if (this.estimateTokens() <= budget) return;
     const before = this.estimateTokens();
 
-    // Pass 1: shrink tool outputs, older exchanges first, then the current one oldest-first.
-    const lastUser = this.messages.findLastIndex((m) => m.role === "user");
+    // Pass 1: drop images from earlier turns, then shrink tool outputs (older exchanges first,
+    // then the current one oldest-first).
+    const lastUser = this.messages.findLastIndex(this.isTurnStart);
+    if (this.countImages(lastUser) > 0) this.dropImages(lastUser, "[image removed to save context]");
     const toolIdx = this.messages.flatMap((m, i) => (m.role === "tool" ? [i] : []));
     const lastRound = this.messages.findLastIndex((m) => m.role === "assistant");
     for (const i of [...toolIdx.filter((i) => i < lastUser), ...toolIdx.filter((i) => i > lastUser && i < lastRound)]) {
@@ -543,13 +668,13 @@ export class Agent {
       const m = this.messages[i] as ChatCompletionToolMessageParam;
       const text = typeof m.content === "string" ? m.content : "";
       if (text.length <= 400 || text.endsWith(ELIDED)) continue;
-      m.content = text.slice(0, 300) + "\n" + ELIDED;
+      m.content = `${text.slice(0, 300)}\n${ELIDED}`;
     }
 
     // Pass 2: drop whole earlier exchanges (a user message up to the next one), oldest first.
     while (this.estimateTokens() > budget) {
-      const firstUser = this.messages.findIndex((m, i) => i > 0 && m.role === "user");
-      const nextUser = this.messages.findIndex((m, i) => i > firstUser && m.role === "user");
+      const firstUser = this.messages.findIndex((m, i) => i > 0 && this.isTurnStart(m));
+      const nextUser = this.messages.findIndex((m, i) => i > firstUser && this.isTurnStart(m));
       if (firstUser < 0 || nextUser < 0) break;
       this.messages.splice(firstUser, nextUser - firstUser);
     }
@@ -558,15 +683,19 @@ export class Agent {
     // and note it on the user message so the model knows work already happened.
     const note = "[Note: earlier steps of this task were removed to save context. Re-read files if you need them.]";
     while (this.estimateTokens() > budget) {
-      const cur = this.messages.findLastIndex((m) => m.role === "user");
+      const cur = this.messages.findLastIndex(this.isTurnStart);
       const start = cur + 1;
       if (this.messages[start]?.role !== "assistant") break;
       let end = start + 1;
-      while (this.messages[end]?.role === "tool") end++;
+      while (this.messages[end]?.role === "tool" || (this.messages[end]?.role === "user" && !this.isTurnStart(this.messages[end]!))) end++;
       if (end >= this.messages.length) break;
       this.messages.splice(start, end - start);
       const user = this.messages[cur]!;
-      if (typeof user.content === "string" && !user.content.endsWith(note)) user.content += `\n\n${note}`;
+      if (typeof user.content === "string") {
+        if (!user.content.endsWith(note)) user.content += `\n\n${note}`;
+      } else if (Array.isArray(user.content) && !(user.content as { text?: string }[]).some((p) => p.text === note)) {
+        (user.content as ChatCompletionContentPart[]).push({ type: "text", text: note });
+      }
     }
 
     // Pass 4: the latest round alone is still too big. Shrink its tool outputs proportionally.
@@ -577,7 +706,7 @@ export class Agent {
       for (const i of latest) {
         const text = String(this.messages[i]!.content);
         const keep = Math.max(200, Math.floor(text.length - (overChars * text.length) / total) - 100);
-        if (keep < text.length) this.messages[i]!.content = text.slice(0, keep) + "\n[... truncated to fit the context window]";
+        if (keep < text.length) this.messages[i]!.content = `${text.slice(0, keep)}\n[... truncated to fit the context window]`;
       }
     }
 
@@ -607,6 +736,12 @@ export function parseArgs(raw: string): unknown {
       throw first;
     }
   }
+}
+
+/** A 400 that complains about image input: the model or server has no vision support. */
+function isImageRejected(err: any): boolean {
+  const msg = `${err?.message ?? ""} ${JSON.stringify(err?.error ?? "")}`.toLowerCase();
+  return err?.status === 400 && /image|vision|multimodal|mmproj|image_url/.test(msg);
 }
 
 function isContextOverflow(err: any): boolean {

@@ -1,8 +1,7 @@
-import { constants, realpathSync } from "node:fs";
-import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat } from "node:fs/promises";
-import { glob } from "node:fs/promises";
+import { constants, type Dirent, realpathSync } from "node:fs";
+import { type FileHandle, glob, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
-import { ToolError, truncate, type Tool, type ToolContext } from "./types.ts";
+import { type ImageData, type Tool, type ToolContext, ToolError, type ToolOutput, truncate } from "./types.ts";
 
 const MAX_READ_CHARS = 60_000;
 const MAX_LIST_ENTRIES = 500;
@@ -56,7 +55,7 @@ async function realInside(root: string, full: string): Promise<string | null> {
  */
 async function writeInWorkspace(ctx: ToolContext, p: string, file: string, data: string): Promise<void> {
   if ((await resolveInWorkspace(ctx, p)) !== file) throw new ToolError(`Path "${p}" changed while writing; aborted.`);
-  let fh;
+  let fh: FileHandle;
   try {
     fh = await open(file, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | (constants.O_NOFOLLOW ?? 0), 0o644);
   } catch (e: any) {
@@ -102,7 +101,7 @@ export const listDir: Tool<{ path?: string; recursive?: boolean }> = {
     const dir = await resolveInWorkspace(ctx, p);
     const out: string[] = [];
     const walk = async (d: string, depth: number) => {
-      let entries;
+      let entries: Dirent[];
       try {
         entries = await readdir(d, { withFileTypes: true });
       } catch (e: any) {
@@ -161,7 +160,10 @@ export const readFileTool: Tool<{ path: string; start_line?: number; end_line?: 
 };
 
 async function exists(p: string): Promise<boolean> {
-  return stat(p).then(() => true, () => false);
+  return stat(p).then(
+    () => true,
+    () => false,
+  );
 }
 
 export const writeFileTool: Tool<{ path: string; content: string }> = {
@@ -344,8 +346,7 @@ export const searchFilesTool: Tool<{ query: string; path?: string; regex?: boole
   name: "search_files",
   risk: "read",
   description:
-    "Search file contents (like grep). Returns 'path:line: text' for each match. " +
-    "Use include to limit to a glob such as '**/*.ts'.",
+    "Search file contents (like grep). Returns 'path:line: text' for each match. " + "Use include to limit to a glob such as '**/*.ts'.",
   parameters: {
     type: "object",
     properties: {
@@ -388,9 +389,47 @@ export const searchFilesTool: Tool<{ query: string; path?: string; regex?: boole
   },
 };
 
+const MAX_IMAGE_BYTES = 5_000_000; // the common provider limit per image
+
+/** Identifies an image by its first bytes rather than its file name. */
+export function sniffImage(buf: Buffer): ImageData["mime"] | undefined {
+  if (buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "image/jpeg";
+  if (buf.subarray(0, 4).toString("latin1") === "GIF8") return "image/gif";
+  if (buf.subarray(0, 4).toString("latin1") === "RIFF" && buf.subarray(8, 12).toString("latin1") === "WEBP") return "image/webp";
+  return undefined;
+}
+
+export const viewImageTool: Tool<{ path: string }, ToolOutput> = {
+  name: "view_image",
+  risk: "read",
+  description:
+    "Look at an image file in the workspace (PNG, JPEG, GIF or WebP, up to 5 MB). The image is shown to you right " +
+    "after this call. Use it for screenshots, diagrams, photos or charts. Needs a vision-capable model.",
+  parameters: {
+    type: "object",
+    properties: { path: { type: "string", description: "Image path relative to the workspace." } },
+    required: ["path"],
+  },
+  async run({ path: p }, ctx) {
+    const file = await resolveInWorkspace(ctx, p);
+    const st = await stat(file).catch(() => null);
+    if (!st?.isFile()) throw new ToolError(`File not found: ${p}`);
+    if (st.size > MAX_IMAGE_BYTES) throw new ToolError(`${p} is ${(st.size / 1e6).toFixed(1)} MB; the limit is 5 MB.`);
+    const buf = await readFile(file);
+    const mime = sniffImage(buf);
+    if (!mime) throw new ToolError(`${p} is not a PNG, JPEG, GIF or WebP image.`);
+    return {
+      text: `Showing ${rel(ctx, file)} (${mime}, ${Math.ceil(buf.length / 1024)} KB).`,
+      images: [{ mime, data: buf.toString("base64") }],
+    };
+  },
+};
+
 export const fsTools: Tool[] = [
   listDir,
   readFileTool,
+  viewImageTool,
   findFilesTool,
   searchFilesTool,
   writeFileTool,
