@@ -1,10 +1,33 @@
+# Dependencies and build/test output
 node_modules/
+coverage/
+*.tgz
+
+# Secrets: environment files, keys, tokens (only the example is committed)
 .env
-.DS_Store
-*.log
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.token
+.llm-agent/
+
+# Runtime state: server PID/log and access tokens, agent workspaces
+.run/
+workspaces/
 playground/*
 !playground/README.md
+
+# Logs
+*.log
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local Claude Code settings
 .claude/
-.run/
-coverage/
-workspaces/
