@@ -1,5 +1,6 @@
 # Full stack: agent web UI + local SearXNG search.
 #   docker compose up -d --build     ->  UI on http://127.0.0.1:8787
+#   make agent-up NAME=alpha         ->  more agents, each in its own container with its own workspace
 #
 # The LLM is NOT in this stack. By default the agent talks to a server on your host
 # (llama.cpp / Ollama / LM Studio) through host.docker.internal, or to OpenAI / Anthropic
@@ -9,6 +10,8 @@ services:
     build: .
     image: llm-agent:latest
     container_name: llm-agent
+    labels:
+      llm-agent.name: default
     restart: unless-stopped
     depends_on:
       - searxng
@@ -21,11 +24,23 @@ services:
       # Inside the container "localhost" is the container itself; reach the host's LLM server instead.
       LLM_BASE_URL: ${DOCKER_LLM_BASE_URL:-http://host.docker.internal:9931/v1}
       SEARXNG_URL: http://searxng:8080
+      TZ: ${TZ:-UTC} # `make docker-up` passes this machine's time zone
     extra_hosts:
       - "host.docker.internal:host-gateway" # needed on Linux; Docker Desktop provides it already
     volumes:
       - ${AGENT_WORKSPACE:-./playground}:/workspace
       - agent-config:/config
+    # Hardening: commands the agent runs stay inside this container and can only write to
+    # /workspace, /config and scratch tmpfs; no extra Linux capabilities, no privilege gain.
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /home/node:uid=1000,gid=1000,mode=0755
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 512
+    mem_limit: 2g
+    cpus: 2
 
   searxng:
     image: searxng/searxng:2026.10.25-54ca1d9cf
@@ -41,3 +56,8 @@ services:
 
 volumes:
   agent-config:
+
+networks:
+  # Fixed name so agents started with `make agent-up` can join and reach searxng.
+  default:
+    name: llm-agent-net

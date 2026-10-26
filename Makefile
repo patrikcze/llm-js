@@ -12,6 +12,7 @@ NPM       ?= npm
 BIOME     ?= npx --no-install biome
 TSC       ?= npx --no-install tsc
 COMPOSE   ?= docker compose
+DOCKER    ?= docker
 
 PORT      ?= 8787
 HOST      ?= 127.0.0.1
@@ -20,6 +21,18 @@ MODE      ?= ask
 MODEL     ?=
 THINK     ?=
 TASK      ?=
+
+# Isolated agents (make agent-up NAME=…)
+NAME        ?=
+AGENT_PORT  ?=
+AGENT_WS    ?= workspaces/$(NAME)
+AGENT_IMAGE ?= llm-agent:latest
+# Containers default to UTC; give them this machine's time zone so "local time" means yours.
+TZ          ?= $(shell $(NODE) -e "console.log(Intl.DateTimeFormat().resolvedOptions().timeZone)" 2>/dev/null || echo UTC)
+CONTAINER   := llm-agent-$(NAME)
+# Same hardening as the compose agent: read-only root, scratch tmpfs, no capabilities, limits.
+HARDENING   := --read-only --tmpfs /tmp --tmpfs /home/node:uid=1000,gid=1000,mode=0755 \
+               --cap-drop ALL --security-opt no-new-privileges:true --pids-limit 512 --memory 2g --cpus 2
 
 RUN_DIR   := .run
 PID_FILE  := $(RUN_DIR)/server.pid
@@ -46,6 +59,7 @@ port_free = { $(NODE) -e "const s=require('net').createServer().once('error',()=
         start stop restart status logs open dev cli run \
         check ci lint fix format format-check typecheck test test-watch coverage audit \
         docker-build docker-up docker-down docker-restart docker-logs docker-ps docker-shell search-up search-down \
+        agent-up agent-down agents agent-logs agent-shell \
         clean distclean
 
 ##@ General
@@ -166,13 +180,13 @@ docker-build: ## Build the agent image
 	$(COMPOSE) build agent
 
 docker-up: ## Build and start the full stack (UI on 127.0.0.1:8787, or AGENT_PORT)
-	$(COMPOSE) up -d --build
+	TZ=$(TZ) $(COMPOSE) up -d --build
 
 docker-down: ## Stop and remove the stack (keeps the settings volume)
 	$(COMPOSE) down
 
 docker-restart: ## Recreate the agent container
-	$(COMPOSE) up -d --build --force-recreate agent
+	TZ=$(TZ) $(COMPOSE) up -d --build --force-recreate agent
 
 docker-logs: ## Follow the agent container log
 	$(COMPOSE) logs -f agent
@@ -188,6 +202,50 @@ search-up: ## Start only SearXNG (for running the agent with Node)
 
 search-down: ## Stop SearXNG
 	$(COMPOSE) stop searxng
+
+##@ Isolated agents (one container + workspace each)
+
+agent-up: ## Start an isolated agent: make agent-up NAME=alpha [AGENT_PORT=8801] [AGENT_WS=dir]
+	@[ -n "$(NAME)" ] || { echo "Usage: make agent-up NAME=<name> [AGENT_PORT=8801] [AGENT_WS=dir] [MODE=...]" >&2; exit 2; }
+	@case "$(NAME)" in *[!a-zA-Z0-9_-]*) echo "NAME may only contain letters, digits, - and _" >&2; exit 2;; esac
+	@if $(DOCKER) ps -a --format '{{.Names}}' | grep -qx "$(CONTAINER)"; then \
+	  echo "$(CONTAINER) already exists. Stop it first: make agent-down NAME=$(NAME)" >&2; exit 1; fi
+	@$(DOCKER) image inspect $(AGENT_IMAGE) >/dev/null 2>&1 || $(COMPOSE) build agent
+	@# A searxng container created before the network was named needs recreating once.
+	@$(COMPOSE) up -d searxng >/dev/null 2>&1 || $(COMPOSE) up -d --force-recreate searxng
+	@mkdir -p "$(AGENT_WS)"
+	@port="$(AGENT_PORT)"; \
+	[ -n "$$port" ] || port=$$($(NODE) -e "const s=require('net').createServer().listen(0,'127.0.0.1',()=>{console.log(s.address().port);s.close()})"); \
+	ws=$$(cd "$(AGENT_WS)" && pwd); \
+	$(DOCKER) run -d --name $(CONTAINER) --label llm-agent.name=$(NAME) --restart unless-stopped \
+	  --network llm-agent-net -p 127.0.0.1:$$port:8787 \
+	  $$([ -f .env ] && echo --env-file .env) \
+	  -e LLM_BASE_URL=$${DOCKER_LLM_BASE_URL:-http://host.docker.internal:9931/v1} -e SEARXNG_URL=http://searxng:8080 -e TZ=$(TZ) \
+	  --add-host host.docker.internal:host-gateway \
+	  -v "$$ws":/workspace -v $(CONTAINER)-config:/config \
+	  $(HARDENING) $(AGENT_IMAGE) node src/server.ts -w /workspace --mode $(MODE) $(if $(THINK),--think $(THINK),) >/dev/null || exit 1; \
+	for i in $$(seq 1 60); do \
+	  if $(NODE) -e "fetch('http://127.0.0.1:$$port/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"; then \
+	    echo "Agent $(NAME) running at http://127.0.0.1:$$port · workspace $$ws · container $(CONTAINER)"; exit 0; fi; \
+	  sleep 0.5; \
+	done; \
+	echo "Agent did not become healthy:" >&2; $(DOCKER) logs --tail 20 $(CONTAINER) >&2; exit 1
+
+agent-down: ## Stop and remove an agent container (keeps its workspace and settings)
+	@[ -n "$(NAME)" ] || { echo "Usage: make agent-down NAME=<name>" >&2; exit 2; }
+	@$(DOCKER) rm -f $(CONTAINER) >/dev/null 2>&1 && echo "Removed $(CONTAINER). Kept workspace $(AGENT_WS) and volume $(CONTAINER)-config." \
+	  || echo "No agent named $(NAME)."
+
+agents: ## List isolated agents
+	@$(DOCKER) ps -a --filter label=llm-agent.name --format 'table {{.Label "llm-agent.name"}}\t{{.Status}}\t{{.Ports}}\t{{.Names}}'
+
+agent-logs: ## Follow an agent's log: make agent-logs NAME=alpha
+	@[ -n "$(NAME)" ] || { echo "Usage: make agent-logs NAME=<name>" >&2; exit 2; }
+	$(DOCKER) logs -f $(CONTAINER)
+
+agent-shell: ## Shell inside an agent's container: make agent-shell NAME=alpha
+	@[ -n "$(NAME)" ] || { echo "Usage: make agent-shell NAME=<name>" >&2; exit 2; }
+	$(DOCKER) exec -it $(CONTAINER) bash
 
 ##@ Housekeeping
 

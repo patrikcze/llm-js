@@ -6,6 +6,9 @@ FROM node:${NODE_VERSION}-alpine
 ENV NODE_ENV=production
 WORKDIR /app
 
+# Tools for the agent's run_command (it executes inside this container) and for grep (ripgrep).
+RUN apk add --no-cache bash git curl jq python3 ripgrep make tzdata
+
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 

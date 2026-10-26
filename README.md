@@ -42,6 +42,7 @@ Run `make` to list everything. These are the common ones:
 | `make coverage`, `make audit` | Coverage report; audit of production dependencies |
 | `make docker-up` / `docker-down` / `docker-logs` | The full Docker stack |
 | `make search-up` | Only SearXNG, for running the agent with Node |
+| `make agent-up NAME=alpha` / `agent-down` / `agents` / `agent-logs` / `agent-shell` | Isolated agents, each in its own hardened container with its own workspace |
 
 Every setting can be overridden: `make start PORT=8800 WORKSPACE=~/code/project MODE=auto-edit MODEL=…`. It works with macOS's GNU Make 3.81. The npm scripts (`npm run check`, `npm run lint`, …) mirror the main targets.
 
@@ -98,7 +99,11 @@ user message
 
 | Tool | Risk | |
 |---|---|---|
-| `list_dir`, `read_file`, `find_files`, `search_files` | read | explore files; line-numbered reads with ranges, glob, grep |
+| `list_dir`, `read_file` | read | explore files; line-numbered reads with ranges |
+| `glob` | read | find files by pattern (`*.ts` matches at any depth), newest first, honours `.gitignore` |
+| `grep` | read | regex search with context lines and `content` / `files` / `count` modes. Uses ripgrep when installed, an identical built-in search otherwise |
+| `local_context` | read | live local date/time and time zone, OS, CPU, memory, shell, installed CLI tools, workspace git branch / last commit / remote and project scripts |
+| `run_command` | execute | shell commands in the workspace (see [Running commands safely](#running-commands-safely)) |
 | `view_image` | read | look at a PNG/JPEG/GIF/WebP in the workspace (vision models) |
 | `write_file`, `edit_file`, `make_dir`, `move_path` | write | `edit_file` needs an exact, unique snippet |
 | `delete_path` | destructive | asks unless the mode is `auto` |
@@ -124,6 +129,51 @@ AGENT_WORKSPACE=~/code/my-project AGENT_PORT=8800 docker compose up -d
 ```
 
 On Linux, the container user (uid 1000) needs write access to the mounted workspace.
+
+### Where does it run? Local vs container, and many agents
+
+- **`make start`, `make dev`, `npm start`:** the agent is a Node process on your machine. Its workspace is a folder on your disk (`WORKSPACE`, default `./playground`), and `run_command` runs **as your user on your machine**.
+- **`make docker-up`:** the agent runs in a container, with `./playground` mounted at `/workspace`. Commands run **inside the container**: they see only `/workspace` and the container, not the rest of your machine.
+- **`make agent-up NAME=…`:** as many isolated agents as you want. Each gets:
+  - its own container `llm-agent-<name>`;
+  - its own workspace `workspaces/<name>` → `/workspace` (or `AGENT_WS=<dir>`);
+  - its own settings volume (provider, model, keys);
+  - its own port (a free one is picked unless you pass `AGENT_PORT`).
+
+  All agents share one SearXNG. Agents can't see each other's workspaces. `agent-down` removes the container but keeps the workspace and settings.
+
+  ```bash
+  make agent-up NAME=research THINK=off          # → http://127.0.0.1:<port>
+  make agent-up NAME=builder AGENT_WS=~/code/app MODE=auto-edit
+  make agents
+  make agent-down NAME=research
+  ```
+
+Every agent container (compose or `agent-up`) is hardened:
+- non-root user (uid 1000);
+- read-only root filesystem, with tmpfs `/tmp` and home;
+- all Linux capabilities dropped, plus `no-new-privileges`;
+- limits of 512 processes, 2 GB memory and 2 CPUs.
+
+Containers get your machine's time zone (`TZ`), so "local time" means yours. The image includes bash, git, curl, jq, python3, ripgrep and make for the agent's commands.
+
+## Running commands safely
+
+`run_command` runs `/bin/sh -c <command>` in the workspace and returns the combined output and exit code. A non-zero exit is reported as an error, with the output. The protections, strongest first:
+
+1. **Approval.** Commands have their own risk level, `execute`. They're refused in `read-only`, and asked for in `ask` and also in `auto-edit` (a command isn't an edit). They only run unasked in `auto`. "Always allow" covers **one exact action**: the command line, the directory and the stdin together. Allowing `git status` never allows `git push`, and `tee f` with different input is asked again.
+2. **Isolation.** In a container (`make docker-up`, `make agent-up`), commands are confined to that container and its `/workspace`. On your machine they run as your user, so keep approval on there. `--no-exec` removes the tool entirely.
+3. **Hygiene:**
+   - Environment variables that look like secrets are removed, by name (`*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `ANTHROPIC_*`, `OPENAI_*`, `AWS_*`, …) and by value (URLs with a password, GitHub/Slack/AWS/npm-style tokens, JWTs, private keys, long opaque strings). It's a denylist, not an allowlist, so a secret with an unusual name and an unusual shape could still pass; an allowlist would break tools that read their own settings (`JAVA_HOME`, `GOPATH`, …).
+   - stdin is closed and there's no TTY; pagers, editors and git/ssh password prompts are disabled.
+   - Each call has a timeout (60 s default, 600 s max).
+   - On timeout or Ctrl+C the whole process group is killed, and anything still running in the background when the command ends is stopped too.
+   - Output keeps its head and tail (30k characters), and colour codes are stripped.
+4. **Blocklist,** even in `auto`: `sudo`/`su`, recursive deletes of `/`, home or system folders, `mkfs`/disk erase, raw disk writes, fork bombs, shutdown/reboot, and `curl … | sh`. It only matches in command position (line start, after `;` `&` `|` `(` or a newline, or after wrappers like `env`, `exec`, `xargs`, `nohup`, optionally with a path), so `grep -r sudo` is fine but `echo hi⏎sudo ls` and `/usr/bin/sudo ls` are blocked. This is defense in depth, not the boundary: no blocklist can catch everything a shell can express.
+
+**Repository internals are off limits to file tools.** `write_file`, `edit_file` and the other file tools refuse anything inside `.git`. A written `.git/config` or hook would make git run programs later, outside the approval gate, so git operations go through `run_command`. For the same reason, read-only tools never run `git status`, and they override every program-launching git setting (fsmonitor, hooks, pager, gpg, external diff).
+
+`local_context` is read-only. It reports the hostname, username, OS and installed tools, and like every tool result this is sent to your model provider. With OpenAI or Anthropic, it leaves your machine.
 
 ## Commands, thinking, streaming and images
 
@@ -192,7 +242,7 @@ A plain `new OpenAI({ baseURL, apiKey })` client is accepted too. Adding a tool 
 ## Development
 
 ```bash
-make check           # lint + format check, types, 55 tests (no model or network needed)
+make check           # lint + format check, types, 86 tests (no model or network needed)
 make coverage
 ```
 
