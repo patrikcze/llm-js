@@ -33,6 +33,8 @@ CONTAINER   := llm-agent-$(NAME)
 # One network per agent: agents cannot reach each other, only the shared SearXNG.
 NET         := llm-agent-$(NAME)-net
 AGENT_TOKEN_FILE = $(RUN_DIR)/agent-$(NAME).token
+# The image inherits Compose's labels (project llm-js, service agent); agent-up overrides them so
+# Docker Desktop shows isolated agents as their own "llm-agents" group, apart from the default stack.
 # Same hardening as the compose agent: read-only root, scratch tmpfs, no capabilities, limits.
 HARDENING   := --read-only --tmpfs /tmp --tmpfs /home/node:uid=1000,gid=1000,mode=0755 \
                --cap-drop ALL --security-opt no-new-privileges:true --pids-limit 512 --memory 2g --cpus 2
@@ -65,7 +67,7 @@ port_free = { $(NODE) -e "const s=require('net').createServer().once('error',()=
         start stop restart status logs open dev cli run \
         check ci lint fix format format-check typecheck test test-watch coverage audit \
         docker-build docker-up docker-down docker-restart docker-logs docker-ps docker-shell search-up search-down \
-        agent-up agent-down agent-cleanup agent-open agents agent-logs agent-shell \
+        agent-up agent-down agent-cleanup agent-open agents agent-logs agent-shell docker-open \
         clean distclean
 
 ##@ General
@@ -99,7 +101,7 @@ start: ## Start the web UI in the background and wait until it is healthy
 	if ! $(port_free); then echo "Port $(PORT) is already in use. Try: make start PORT=8800" >&2; exit 1; fi; \
 	tok=$$($(gen_token)); (umask 077; echo $$tok > $(TOKEN_FILE)); \
 	echo "--- $$(date '+%Y-%m-%d %H:%M:%S') start: $(SERVER_ARGS)" >> $(LOG_FILE); \
-	AGENT_TOKEN=$$tok HOST=$(HOST) nohup $(NODE) src/server.ts $(SERVER_ARGS) >> $(LOG_FILE) 2>&1 & echo $$! > $(PID_FILE); \
+	AGENT_TOKEN=$$tok AGENT_OPEN_HINT="make open$(if $(filter command line,$(origin PORT)), PORT=$(PORT),)" HOST=$(HOST) nohup $(NODE) src/server.ts $(SERVER_ARGS) >> $(LOG_FILE) 2>&1 & echo $$! > $(PID_FILE); \
 	for i in $$(seq 1 40); do \
 	  if $(healthy); then echo "llm-agent UI running (pid $$(cat $(PID_FILE)), log $(LOG_FILE))"; echo "Open: $(URL)/?token=$$tok"; exit 0; fi; \
 	  if ! $(is_running); then break; fi; \
@@ -193,18 +195,22 @@ audit: ## Audit production dependencies for known vulnerabilities
 docker-build: ## Build the agent image
 	$(COMPOSE) build agent
 
-docker-up: ## Build and start the full stack (UI on 127.0.0.1:8787, or AGENT_PORT)
+docker-up: ## Build and start the default agent + SearXNG (one agent; more agents: make agent-up NAME=…)
+	@if [ "$(origin PORT)" = "command line" ] || [ -n "$(NAME)" ]; then \
+	  echo "docker-up runs the one default agent (container llm-agent, port $(or $(AGENT_PORT),8787)); it does not take PORT or NAME." >&2; \
+	  echo "To start an additional isolated agent:  make agent-up NAME=<name> [AGENT_PORT=8801]" >&2; \
+	  echo "To move the default agent to another port:  make docker-up AGENT_PORT=8801" >&2; exit 2; fi
 	@mkdir -p $(RUN_DIR); [ -s $(RUN_DIR)/docker.token ] || (umask 077; $(gen_token) > $(RUN_DIR)/docker.token)
-	@AGENT_TOKEN=$$(cat $(RUN_DIR)/docker.token) TZ=$(TZ) $(COMPOSE) up -d --build
-	@echo "Open: http://127.0.0.1:$${AGENT_PORT:-8787}/?token=$$(cat $(RUN_DIR)/docker.token)"
+	@AGENT_PORT=$(or $(AGENT_PORT),8787) AGENT_TOKEN=$$(cat $(RUN_DIR)/docker.token) TZ=$(TZ) $(COMPOSE) up -d --build
+	@echo "Open: http://127.0.0.1:$(or $(AGENT_PORT),8787)/?token=$$(cat $(RUN_DIR)/docker.token)"
 
 docker-down: ## Stop and remove the stack (keeps the settings volume)
 	$(COMPOSE) down
 
 docker-restart: ## Recreate the agent container
 	@mkdir -p $(RUN_DIR); [ -s $(RUN_DIR)/docker.token ] || (umask 077; $(gen_token) > $(RUN_DIR)/docker.token)
-	@AGENT_TOKEN=$$(cat $(RUN_DIR)/docker.token) TZ=$(TZ) $(COMPOSE) up -d --build --force-recreate agent
-	@echo "Open: http://127.0.0.1:$${AGENT_PORT:-8787}/?token=$$(cat $(RUN_DIR)/docker.token)"
+	@AGENT_PORT=$(or $(AGENT_PORT),8787) AGENT_TOKEN=$$(cat $(RUN_DIR)/docker.token) TZ=$(TZ) $(COMPOSE) up -d --build --force-recreate agent
+	@echo "Open: http://127.0.0.1:$(or $(AGENT_PORT),8787)/?token=$$(cat $(RUN_DIR)/docker.token)"
 
 docker-logs: ## Follow the agent container log
 	$(COMPOSE) logs -f agent
@@ -239,7 +245,8 @@ agent-up: ## Start an isolated agent: make agent-up NAME=alpha [AGENT_PORT=8801]
 	[ -n "$$port" ] || port=$$($(NODE) -e "const s=require('net').createServer().listen(0,'127.0.0.1',()=>{console.log(s.address().port);s.close()})"); \
 	ws=$$(cd "$(AGENT_WS)" && pwd); \
 	$(DOCKER) run -d --name $(CONTAINER) --label llm-agent.name=$(NAME) --restart unless-stopped \
-	  --network $(NET) -p 127.0.0.1:$$port:8787 -e AGENT_TOKEN=$$tok \
+	  --label com.docker.compose.project=llm-agents --label com.docker.compose.service=$(NAME) \
+	  --network $(NET) -p 127.0.0.1:$$port:8787 -e AGENT_TOKEN=$$tok -e "AGENT_OPEN_HINT=make agent-open NAME=$(NAME)" \
 	  $$([ -f .env ] && echo --env-file .env) \
 	  -e LLM_BASE_URL=$${DOCKER_LLM_BASE_URL:-http://host.docker.internal:9931/v1} -e SEARXNG_URL=http://searxng:8080 -e TZ=$(TZ) \
 	  --add-host host.docker.internal:host-gateway \
@@ -274,6 +281,14 @@ agent-open: ## Open an agent's UI in your browser: make agent-open NAME=alpha
 
 agents: ## List isolated agents
 	@$(DOCKER) ps -a --filter label=llm-agent.name --format 'table {{.Label "llm-agent.name"}}\t{{.Status}}\t{{.Ports}}\t{{.Names}}'
+	@echo "Open one signed in: make agent-open NAME=<name> (the default agent: make docker-open)"
+
+docker-open: ## Open the default Docker agent's UI with its access token
+	@[ -s $(RUN_DIR)/docker.token ] || { echo "No token yet: run make docker-up" >&2; exit 1; }
+	@port=$$($(DOCKER) port llm-agent 8787 2>/dev/null | head -1 | sed 's/.*://'); \
+	[ -n "$$port" ] || { echo "The default agent is not running: make docker-up" >&2; exit 1; }; \
+	u="http://127.0.0.1:$$port/?token=$$(cat $(RUN_DIR)/docker.token)"; \
+	command -v open >/dev/null && open "$$u" || xdg-open "$$u" >/dev/null 2>&1 || echo "$$u"
 
 agent-logs: ## Follow an agent's log: make agent-logs NAME=alpha
 	@[ -n "$(NAME)" ] || { echo "Usage: make agent-logs NAME=<name>" >&2; exit 2; }

@@ -28,6 +28,7 @@ services:
       # Access token for the UI and API (`make docker-up` creates one and prints the URL).
       # Empty = random per start, shown in `docker compose logs agent`.
       AGENT_TOKEN: ${AGENT_TOKEN:-}
+      AGENT_OPEN_HINT: make docker-open
     extra_hosts:
       - "host.docker.internal:host-gateway" # needed on Linux; Docker Desktop provides it already
     volumes:

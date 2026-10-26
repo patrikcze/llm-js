@@ -233,11 +233,17 @@ function cookieToken(req: IncomingMessage): string | undefined {
 
 const authorized = (req: IncomingMessage) => sameSecret(cookieToken(req)) || sameSecret(req.headers["x-agent-token"] as string | undefined);
 
-const LOGIN_PAGE = `<!doctype html><meta charset="utf-8"><title>LLM Agent</title>
-<style>body{background:#0b1212;color:#cfe7e0;font:14px/1.6 ui-monospace,Menlo,monospace;display:grid;place-items:center;height:100vh;margin:0}
-div{max-width:520px;border:1px solid #3c5752;padding:24px 28px}h1{font-size:14px;letter-spacing:.3em;color:#8fe3cf;margin:0 0 12px}code{color:#8fe3cf}</style>
-<div><h1>LLM//AGENT · ACCESS REQUIRED</h1>This agent needs its access token. Open the full URL printed when the server started,
-the one ending in <code>/?token=…</code> (<code>make start</code> prints it and <code>make open</code> opens it; for Docker agents use <code>make agent-open NAME=…</code> or <code>make docker-up</code>).</div>`;
+// How to open this agent, set by whoever started it (the Makefile); shown on the access page.
+const openHint = (process.env.AGENT_OPEN_HINT ?? "").replace(/[^\w .=:/-]/g, "");
+const LOGIN_PAGE = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>LLM Agent</title>
+<style>body{background:#0b1212;color:#cfe7e0;font:14px/1.6 ui-monospace,Menlo,monospace;display:grid;place-items:center;min-height:100vh;margin:0;padding:16px;box-sizing:border-box}
+div{max-width:560px;border:1px solid #3c5752;padding:24px 28px}h1{font-size:14px;letter-spacing:.3em;color:#8fe3cf;margin:0 0 12px}code{color:#8fe3cf}
+form{display:flex;gap:8px;margin-top:16px}input{flex:1;min-width:0;background:#000;color:#cfe7e0;border:1px solid #3c5752;padding:8px 10px;font:inherit}
+button{background:#8fe3cf;color:#0b1212;border:0;padding:8px 16px;font:inherit;font-weight:700;letter-spacing:.15em;cursor:pointer}</style>
+<div><h1>LLM//AGENT · ACCESS REQUIRED</h1>
+Each agent has its own access token, so one agent cannot control another.
+${openHint ? `Open this one signed in with <code>${openHint}</code>, or paste its token:` : "Open the URL printed when it started (ending in <code>/?token=…</code>), or paste its token:"}
+<form method="get" action="/"><input name="token" type="password" placeholder="access token" autocomplete="off" autofocus aria-label="Access token"><button>Unlock</button></form></div>`;
 
 /** Rejects cross-site requests and DNS rebinding: Host must be ours, Origin must match, bodies must be JSON. */
 function sameOrigin(req: IncomingMessage): boolean {

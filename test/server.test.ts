@@ -33,7 +33,14 @@ before(async () => {
   base = `http://127.0.0.1:${port}`;
   tmp = await mkdtemp(path.join(os.tmpdir(), "agent-server-"));
   child = spawn(process.execPath, ["src/server.ts", "--port", String(port), "-w", tmp], {
-    env: { ...process.env, AGENT_TOKEN: TOKEN, AGENT_CONFIG_DIR: tmp, LLM_BASE_URL: "http://127.0.0.1:1/v1", HOST: "127.0.0.1" },
+    env: {
+      ...process.env,
+      AGENT_TOKEN: TOKEN,
+      AGENT_CONFIG_DIR: tmp,
+      LLM_BASE_URL: "http://127.0.0.1:1/v1",
+      HOST: "127.0.0.1",
+      AGENT_OPEN_HINT: 'make agent-open NAME=t1<script>"',
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
   child.stdout?.on("data", (d) => {
@@ -86,6 +93,13 @@ describe("access token", () => {
     // And nothing changed.
     const info = await (await call("/api/info", { headers: { "x-agent-token": TOKEN } })).json();
     assert.equal(info.mode, "ask");
+  });
+
+  it("the access page says how to open this agent and accepts a pasted token (hint sanitized)", async () => {
+    const page = await (await call("/")).text();
+    assert.match(page, /<code>make agent-open NAME=t1script<\/code>/);
+    assert.doesNotMatch(page, /<script>/);
+    assert.match(page, /<form method="get" action="\/"><input name="token" type="password"/);
   });
 
   it("rejects wrong, empty and near-miss tokens", async () => {
