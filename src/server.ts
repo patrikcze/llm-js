@@ -8,8 +8,14 @@
  * whose port is published on the host's loopback only). Every API call must come from the page
  * itself: Host must be localhost/127.0.0.1 (or listed in AGENT_ALLOWED_HOSTS), Origin must match,
  * and bodies must be JSON. So other websites in your browser cannot drive the agent.
+ *
+ * Access token: those header checks are spoofable by any program that can reach the port, e.g.
+ * a command running in another agent's container (via the Docker network or the host gateway).
+ * So everything except /healthz also needs a secret token, set from the URL printed at startup
+ * (`?token=…`) into an HttpOnly cookie, or sent as the `x-agent-token` header. AGENT_TOKEN
+ * fixes the token (the Makefile does); otherwise a random one is generated at every start.
  */
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
@@ -200,6 +206,39 @@ function json(res: ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" }).end(JSON.stringify(body));
 }
 
+// --- access token ---------------------------------------------------------------
+
+const token = process.env.AGENT_TOKEN?.trim() || randomBytes(24).toString("base64url");
+if (token.length < 16) {
+  console.error("AGENT_TOKEN must be at least 16 characters.");
+  process.exit(2);
+}
+// Cookies are shared between ports on one host (localhost:8787 and localhost:8800), so the name carries the port.
+const cookieName = `agent_session_${port}`;
+
+function sameSecret(given: string | undefined): boolean {
+  if (!given) return false;
+  const a = Buffer.from(given);
+  const b = Buffer.from(token);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function cookieToken(req: IncomingMessage): string | undefined {
+  for (const part of (req.headers.cookie ?? "").split(";")) {
+    const [name, ...value] = part.trim().split("=");
+    if (name === cookieName) return value.join("=");
+  }
+  return undefined;
+}
+
+const authorized = (req: IncomingMessage) => sameSecret(cookieToken(req)) || sameSecret(req.headers["x-agent-token"] as string | undefined);
+
+const LOGIN_PAGE = `<!doctype html><meta charset="utf-8"><title>LLM Agent</title>
+<style>body{background:#0b1212;color:#cfe7e0;font:14px/1.6 ui-monospace,Menlo,monospace;display:grid;place-items:center;height:100vh;margin:0}
+div{max-width:520px;border:1px solid #3c5752;padding:24px 28px}h1{font-size:14px;letter-spacing:.3em;color:#8fe3cf;margin:0 0 12px}code{color:#8fe3cf}</style>
+<div><h1>LLM//AGENT · ACCESS REQUIRED</h1>This agent needs its access token. Open the full URL printed when the server started,
+the one ending in <code>/?token=…</code> (<code>make start</code> prints it and <code>make open</code> opens it; for Docker agents use <code>make agent-open NAME=…</code> or <code>make docker-up</code>).</div>`;
+
 /** Rejects cross-site requests and DNS rebinding: Host must be ours, Origin must match, bodies must be JSON. */
 function sameOrigin(req: IncomingMessage): boolean {
   const hostHeader = req.headers.host ?? "";
@@ -223,6 +262,27 @@ const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", "http://localhost");
   try {
     if (req.method === "GET" && url.pathname === "/healthz") return json(res, 200, { ok: true });
+
+    // Sign in: a correct ?token= sets the session cookie and redirects to the clean URL.
+    if (req.method === "GET" && url.pathname === "/" && url.searchParams.has("token")) {
+      if (!sameSecret(url.searchParams.get("token") ?? undefined) || !sameOrigin(req)) {
+        return res.writeHead(401, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }).end(LOGIN_PAGE);
+      }
+      return res
+        .writeHead(302, {
+          location: "/",
+          "set-cookie": `${cookieName}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000`,
+          "cache-control": "no-store",
+          "referrer-policy": "no-referrer",
+        })
+        .end();
+    }
+    if (!authorized(req)) {
+      if (req.method === "GET" && url.pathname === "/") {
+        return res.writeHead(401, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }).end(LOGIN_PAGE);
+      }
+      return json(res, 401, { error: "access token required" });
+    }
 
     const asset = req.method === "GET" ? staticFile(url) : undefined;
     if (asset) {
@@ -401,7 +461,9 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(port, host, () => {
-  console.log(host === "0.0.0.0" ? `llm-agent UI listening on 0.0.0.0:${port} (container)` : `llm-agent UI: http://${host}:${port}`);
+  const shown = host === "0.0.0.0" ? "127.0.0.1" : host;
+  console.log(host === "0.0.0.0" ? `llm-agent UI listening on 0.0.0.0:${port} (container)` : `llm-agent UI listening on ${host}:${port}`);
+  console.log(`Open: http://${shown}:${port}/?token=${token}`);
   console.log(
     `${PROVIDERS[active.provider].label} · ${agent.model || "(no model selected)"} @ ${active.baseURL} · workspace ${cfg.workspace} · mode ${cfg.mode}`,
   );

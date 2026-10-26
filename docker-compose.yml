@@ -25,6 +25,9 @@ services:
       LLM_BASE_URL: ${DOCKER_LLM_BASE_URL:-http://host.docker.internal:9931/v1}
       SEARXNG_URL: http://searxng:8080
       TZ: ${TZ:-UTC} # `make docker-up` passes this machine's time zone
+      # Access token for the UI and API (`make docker-up` creates one and prints the URL).
+      # Empty = random per start, shown in `docker compose logs agent`.
+      AGENT_TOKEN: ${AGENT_TOKEN:-}
     extra_hosts:
       - "host.docker.internal:host-gateway" # needed on Linux; Docker Desktop provides it already
     volumes:

@@ -142,12 +142,13 @@ On Linux, the container user (uid 1000) needs write access to the mounted worksp
   - its own settings volume (provider, model, keys);
   - its own port (a free one is picked unless you pass `AGENT_PORT`).
 
-  All agents share one SearXNG. Agents can't see each other's workspaces. `agent-down` removes the container but keeps the workspace and settings.
+  Agents share one SearXNG but nothing else: separate workspaces, separate settings, and each agent is on its own Docker network (`llm-agent-<name>-net`). `agent-down` removes the container and its network and token, and keeps the workspace and settings.
 
   ```bash
   make agent-up NAME=research THINK=off          # → http://127.0.0.1:<port>
   make agent-up NAME=builder AGENT_WS=~/code/app MODE=auto-edit
   make agents
+  make agent-open NAME=research                  # opens the UI with its access token
   make agent-down NAME=research
   ```
 
@@ -216,6 +217,8 @@ KaTeX and Mermaid are served from `node_modules`, so this works offline and in D
 
 ## Browser UI security
 
+- **Access token.** Every request except `/healthz` needs a secret token. Starting a server prints a URL ending in `/?token=…`; opening it sets an `HttpOnly`, `SameSite=Strict` cookie (named per port, so agents on different ports don't collide) and redirects to the clean URL. `make start`, `make docker-up` and `make agent-up` print the URL, and `make open` / `make agent-open` open it. `AGENT_TOKEN` fixes the token; otherwise it's random per start. This is what stops **one agent from controlling another**: commands the agent runs can otherwise reach other agents' ports through the Docker network or the host gateway (`host.docker.internal`), and the Origin/Host checks are only headers that a program can forge. Tested: from inside one agent, a request to a second agent's published port with forged headers gets `401`. The token is also removed from commands' environments.
+- **Docker networks do not isolate agents on every machine.** I checked: on Docker Desktop here, containers on separate bridge networks could still reach each other through the VM's gateway. Per-agent networks are defense in depth, and the token is the actual boundary. `/healthz` stays open (health checks) and reveals only that something is listening.
 - The server binds to `127.0.0.1` by default (`HOST=0.0.0.0` only inside the container).
 - API calls must carry this server's Host and Origin and a JSON body, so other sites in your browser can't drive the agent, and DNS rebinding is blocked. To expose it on a LAN name, add it to `AGENT_ALLOWED_HOSTS` (there is no login, so only do this on a trusted network).
 - Model output is rendered through DOMPurify, under a strict Content-Security-Policy.
