@@ -99,7 +99,7 @@ port_free = { $(NODE) -e "const s=require('net').createServer().once('error',()=
         docker-build docker-scan docker-up docker-down docker-restart docker-logs docker-ps docker-shell search-up search-down \
         agent-up agent-down agent-cleanup agent-open agents agent-logs agent-shell docker-open searxng-attach \
         openshell-up openshell-down openshell-open openshell-allow openshell-logs openshell-pull openshell-push openshell-list \
-        clean distclean
+        down purge clean distclean
 
 ##@ General
 
@@ -285,6 +285,7 @@ search-down: ## Stop SearXNG
 openshell-up: ## Start an agent in an OpenShell sandbox: make openshell-up NAME=alpha [AGENT_PORT=8801] [AGENT_WS=dir]
 	@[ -n "$(NAME)" ] || { echo "Usage: make openshell-up NAME=<name> [AGENT_PORT=8801] [AGENT_WS=dir] [MODE=...]" >&2; exit 2; }
 	@case "$(NAME)" in *[!a-zA-Z0-9-]*) echo "NAME may only contain letters, digits and -" >&2; exit 2;; esac
+	@[ $$(printf %s "$(NAME)" | wc -c) -le 9 ] || { echo "NAME may be at most 9 characters (OpenShell limits sandbox names to 19, including llm-agent-)." >&2; exit 2; }
 	@command -v $(OPENSHELL) >/dev/null || { echo "OpenShell CLI not found: https://github.com/NVIDIA/OpenShell" >&2; exit 1; }
 	@$(OPENSHELL) status >/dev/null 2>&1 || { echo "No OpenShell gateway is reachable: brew services start openshell (see make doctor / openshell doctor)" >&2; exit 1; }
 	@if $(OPENSHELL) sandbox get $(SANDBOX) >/dev/null 2>&1; then \
@@ -433,9 +434,49 @@ agent-shell: ## Shell inside an agent's container: make agent-shell NAME=alpha
 
 ##@ Housekeeping
 
-clean: ## Remove logs, PID files and coverage output (stops the server first)
-	@$(MAKE) --no-print-directory stop >/dev/null
+# Everything below finds what this project started by its labels and names, so it also catches
+# agents and sandboxes started from another terminal or before a restart.
+down: ## Stop and remove everything this project started (server, stack, agents, sandboxes); keeps workspaces, settings and images
+	@echo "Stopping the local server…"; $(MAKE) --no-print-directory stop >/dev/null 2>&1 || true
+	@if command -v $(OPENSHELL) >/dev/null 2>&1 && $(OPENSHELL) status >/dev/null 2>&1; then \
+	  for sb in $$($(OPENSHELL) sandbox list --selector app=llm-agent 2>/dev/null | awk 'NR>1 && $$1 ~ /^llm-agent-/ {print $$1}'); do \
+	    echo "OpenShell sandbox $$sb: copying its workspace out, then deleting it…"; \
+	    $(MAKE) --no-print-directory openshell-down NAME=$${sb#llm-agent-} || echo "  kept $$sb (see above)" >&2; \
+	  done; \
+	else echo "OpenShell: no gateway reachable, skipped."; fi
+	@if ! $(DOCKER) info >/dev/null 2>&1; then echo "$(DOCKER): engine not running, skipped containers."; exit 0; fi; \
+	for c in $$($(DOCKER) ps -a --filter label=llm-agent.name --format '{{.Names}}' | grep '^llm-agent-' | grep -vx 'llm-agent-searxng'); do \
+	  $(MAKE) --no-print-directory agent-down NAME=$${c#llm-agent-}; \
+	done; \
+	echo "Stopping the Compose stack (default agent + SearXNG)…"; $(COMPOSE) down --remove-orphans >/dev/null 2>&1 || true; \
+	for net in $$($(DOCKER) network ls --filter label=llm-agent.name --format '{{.Name}}'); do \
+	  $(DOCKER) network rm $$net >/dev/null 2>&1 && echo "Removed leftover network $$net."; \
+	done; \
+	echo "Done. Kept: workspaces/ and $(WORKSPACE)/, settings volumes, images and tokens in $(RUN_DIR)/ (make purge removes those, except workspaces)."
+
+purge: ## down + delete settings volumes, the project's images and .run/ secrets (asks first; never deletes workspaces)
+	@if [ "$(CONFIRM)" != "yes" ]; then \
+	  if [ -t 0 ]; then \
+	    printf "This stops everything and deletes saved settings and API keys (volumes), the llm-agent and SearXNG images\nand $(RUN_DIR)/ (tokens, secrets). Workspaces are kept. Type yes to continue: "; read ans; [ "$$ans" = yes ] || { echo "Cancelled."; exit 1; }; \
+	  else echo "make purge deletes settings, images and secrets; run it in a terminal or with CONFIRM=yes." >&2; exit 1; fi; fi
+	@$(MAKE) --no-print-directory down
+	@if $(DOCKER) info >/dev/null 2>&1; then \
+	  $(COMPOSE) down --volumes --rmi all >/dev/null 2>&1 || true; \
+	  for v in $$($(DOCKER) volume ls --format '{{.Name}}' | grep -E '^llm-agent-.+-config$$|_agent-config$$'); do \
+	    $(DOCKER) volume rm $$v >/dev/null && echo "Removed volume $$v."; \
+	  done; \
+	  for i in $$($(DOCKER) image ls --format '{{.Repository}}:{{.Tag}}' | grep -E '^(localhost/)?llm-agent:'); do \
+	    $(DOCKER) image rm $$i >/dev/null 2>&1 && echo "Removed image $$i."; \
+	  done; \
+	  old=$$($(DOCKER) image ls --format '{{.Repository}}:{{.Tag}}' | grep -E '(^|/)searxng/searxng:' | tr '\n' ' '); \
+	  [ -z "$$old" ] || echo "Other SearXNG images are left alone (they may not be ours): $$old"; \
+	fi
 	rm -rf $(RUN_DIR) coverage
+	@echo "Purged. Your workspaces are untouched: workspaces/ and $(WORKSPACE)/."
+
+clean: ## Stop the local server and remove its log, PID file and coverage output (agents' tokens stay)
+	@$(MAKE) --no-print-directory stop >/dev/null
+	rm -rf $(LOG_FILE) $(PID_FILE) $(TOKEN_FILE) coverage
 
 distclean: clean ## clean + remove node_modules
 	rm -rf node_modules

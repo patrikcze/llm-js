@@ -46,6 +46,9 @@ Run `make` to list everything. Targets that need Node dependencies (`start`, `ch
 | `make fix` | Apply formatting, import sorting and safe lint fixes |
 | `make coverage`, `make audit` | Coverage report; audit of production dependencies |
 | `make docker-scan` | Scan the agent image for known vulnerabilities (Trivy or Docker Scout) |
+| `make down` | Stop and remove everything this project started: the local server, OpenShell sandboxes (their workspaces are copied out first), isolated agents, the Compose stack and leftover networks. Keeps workspaces, settings volumes, images and tokens |
+| `make purge` | `down`, then also delete settings volumes (saved providers and API keys), the project's images and `.run/` (tokens, secrets). Asks first (`CONFIRM=yes` skips that); never deletes workspaces |
+| `make clean` / `make distclean` | Remove the local server's log and coverage output / also `node_modules` |
 | `make docker-up` / `docker-open` / `docker-down` / `docker-logs` | The default Docker agent + SearXNG. With `NAME=…`, `docker-up` starts an isolated agent instead (same as `agent-up`). It takes `AGENT_PORT`, not `PORT` |
 | `make search-up` | Only SearXNG, for running the agent with Node |
 | `make agent-up NAME=alpha` / `agent-open` / `agent-down` / `agents` / `agent-logs` / `agent-shell` | Isolated agents, each in its own hardened container with its own workspace, settings and token |
