@@ -138,10 +138,20 @@
   }
 
   /* ---------- transcript ---------- */
-  main { grid-row: 2; overflow-y: auto; min-height: 0; position: relative; scroll-behavior: smooth; }
+  /* No scroll-behavior: smooth here. Following the stream sets scrollTop every frame, and each smooth
+     animation would restart and fight the user's own scrolling (visible as flicker). */
+  main { grid-row: 2; overflow-y: auto; min-height: 0; position: relative; overscroll-behavior: contain; }
   main::-webkit-scrollbar, aside::-webkit-scrollbar { width: 6px; }
   main::-webkit-scrollbar-thumb, aside::-webkit-scrollbar-thumb { background: var(--faint); }
   #log { max-width: 860px; min-height: 100%; margin: 0 auto; padding: 18px 34px 30px; display: flex; flex-direction: column; gap: 16px; }
+  /* Shown while the user has scrolled away from a live answer; sticks to the bottom of the view. */
+  .md-part { display: contents; } /* streaming halves of one answer; lay out as if they were one */
+  .jump {
+    position: sticky; bottom: 14px; display: block; margin: -34px auto 0; z-index: 2;
+    padding: 6px 14px; font: inherit; font-size: 10.5px; letter-spacing: .22em; text-transform: uppercase;
+    color: var(--accent); background: var(--bg-2); border: 1px solid var(--line-strong); cursor: pointer;
+    box-shadow: 0 0 14px var(--accent-glow);
+  }
 
   .empty { display: grid; place-items: center; flex: 1; }
   .orbit { position: relative; width: 250px; height: 250px; display: grid; place-items: center; }
@@ -463,6 +473,7 @@
         <div class="orbit"><div class="ring"></div><div class="ring inner"></div><div class="typed" id="typed"></div></div>
       </div>
     </div>
+    <button type="button" class="jump" id="jump" hidden>↓ Latest</button>
   </main>
 
   <footer>
@@ -805,13 +816,55 @@ function el(tag, cls, text) {
   if (text !== undefined) e.textContent = text;
   return e;
 }
-function nearBottom(px = 160) { return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < px; }
-function stick() { if (nearBottom()) scroller.scrollTop = scroller.scrollHeight; }
+// Following the stream. The view sticks to the newest output only while the user is at the bottom:
+// any scroll away (wheel, touch, keys, scrollbar) stops it at once, and returning to the bottom (or
+// the "Latest" button) resumes it. Programmatic scrolls are instant and at most one per frame, so they
+// never fight the user's own scrolling.
+const jumpBtn = $("jump");
+let follow = true, followFrame = 0, ourTop = -1, jumping = false;
+const atBottom = (px = 24) => scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= px;
+function setFollow(on) {
+  follow = on;
+  jumpBtn.hidden = on || !busy;
+}
+function stick() {
+  if (!follow || followFrame) return;
+  followFrame = requestAnimationFrame(() => {
+    followFrame = 0;
+    if (!follow) return;
+    scroller.scrollTop = scroller.scrollHeight;
+    ourTop = scroller.scrollTop;
+  });
+}
+scroller.addEventListener("scroll", () => {
+  if (Math.abs(scroller.scrollTop - ourTop) < 2) return; // our own follow scroll
+  if (jumping) { if (atBottom()) { jumping = false; setFollow(true); } return; }
+  setFollow(atBottom());
+}, { passive: true });
+// Wheel and touch say "the user is scrolling" before the scroll event does: stop following right away.
+scroller.addEventListener("wheel", (e) => { if (e.deltaY < 0) { jumping = false; setFollow(false); } }, { passive: true });
+scroller.addEventListener("touchmove", () => { jumping = false; if (!atBottom()) setFollow(false); }, { passive: true });
+jumpBtn.addEventListener("click", () => {
+  jumping = true;
+  scroller.scrollTo({ top: scroller.scrollHeight, behavior: reduceMotion ? "auto" : "smooth" });
+});
+/**
+ * Where a streaming answer can be split: after the last blank line that is not inside a code fence or
+ * a $$ math block. Everything before it is finished Markdown and can be rendered once.
+ */
+function stableCut(s, from) {
+  for (let i = s.lastIndexOf("\n\n"); i > from; i = s.lastIndexOf("\n\n", i - 1)) {
+    const head = s.slice(0, i);
+    const fences = (head.match(/^ {0,3}(```|~~~)/gm) ?? []).length;
+    const dollars = (head.match(/\$\$/g) ?? []).length;
+    if (fences % 2 === 0 && dollars % 2 === 0) return i + 2;
+  }
+  return from;
+}
 function add(node) {
   $("empty")?.remove();
-  const stay = nearBottom();
   (working.isConnected ? working.before(node) : log.append(node));
-  if (stay) scroller.scrollTop = scroller.scrollHeight;
+  stick();
   return node;
 }
 function message(kind, who) {
@@ -891,6 +944,7 @@ const refreshInfo = () => call("/api/info").then((r) => r.json()).then(showInfo)
 // ---------------------------------------------------------------- one run
 async function run(message_, images = []) {
   busy = true;
+  setFollow(true); // a new question: show its answer
   sendBtn.textContent = "Abort"; sendBtn.classList.replace("solid", "danger");
   const [u, ub] = message("user", "› Operator"); ub.textContent = message_;
   if (images.length) {
@@ -901,14 +955,30 @@ async function run(message_, images = []) {
   add(u);
   log.append(working); status("Uplink · awaiting model"); stick();
 
-  let textBody = null, textBuf = "", thinkBlock = null, frame = 0, steps = 0, sawText = false;
+  // Streaming output is drawn at most once per frame. Finished Markdown blocks go into `textDone` once
+  // and stay; only the block still being written (`textLive`) is re-rendered, so the text the user is
+  // reading is never replaced under them. The finished message is rendered once more as a whole.
+  let textBody = null, textDone = null, textLive = null, textBuf = "", stableLen = 0;
+  let thinkBlock = null, thinkPending = "", frame = 0, steps = 0, sawText = false;
   const tools = new Map();
-  const flushText = () => { frame = 0; if (textBody) { textBody.innerHTML = md(textBuf); stick(); } };
+  const flushThink = () => { if (thinkBlock && thinkPending) thinkBlock.append(thinkPending); thinkPending = ""; };
+  const flush = () => {
+    frame = 0;
+    flushThink();
+    if (textBody) {
+      const cut = stableCut(textBuf, stableLen);
+      if (cut > stableLen) { textDone.insertAdjacentHTML("beforeend", md(textBuf.slice(stableLen, cut))); stableLen = cut; }
+      textLive.innerHTML = md(textBuf.slice(stableLen));
+    }
+    stick();
+  };
+  const schedule = () => { if (!frame) frame = requestAnimationFrame(flush); };
   const endText = () => {
     if (frame) cancelAnimationFrame(frame);
     frame = 0;
+    flushThink();
     if (textBody) { textBody.innerHTML = md(textBuf, true); enhance(textBody); stick(); }
-    textBody = null; textBuf = ""; thinkBlock = null;
+    textBody = textDone = textLive = null; textBuf = ""; stableLen = 0; thinkBlock = null;
   };
 
   const handlers = {
@@ -918,13 +988,16 @@ async function run(message_, images = []) {
         det.append(el("summary", "", "Reasoning trace"), (thinkBlock = el("div")));
         status("Reasoning");
       }
-      thinkBlock.textContent += d; stick();
+      thinkPending += d; schedule();
     },
     text(d) {
-      thinkBlock = null; sawText = true;
-      if (!textBody) { const [box, body] = message("assistant", "◇ Agent"); add(box); textBody = body; status("Transmitting"); }
-      textBuf += d;
-      if (!frame) frame = requestAnimationFrame(flushText);
+      flushThink(); thinkBlock = null; sawText = true;
+      if (!textBody) {
+        const [box, body] = message("assistant", "◇ Agent");
+        textDone = el("div", "md-part"); textLive = el("div", "md-part");
+        body.append(textDone, textLive); add(box); textBody = body; status("Transmitting");
+      }
+      textBuf += d; schedule();
     },
     tool_call(c) {
       endText();
@@ -1011,6 +1084,7 @@ async function run(message_, images = []) {
     endText();
     working.remove();
     busy = false;
+    jumpBtn.hidden = true;
     sendBtn.textContent = "Transmit"; sendBtn.classList.replace("danger", "solid");
     for (const s of log.querySelectorAll(".tool .pulse")) { s.parentElement.className = "status error"; s.parentElement.textContent = "ABORTED"; }
     for (const b of log.querySelectorAll(".approval .buttons")) b.replaceWith(el("div", "decided", "Aborted"));
