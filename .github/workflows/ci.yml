@@ -12,24 +12,34 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node: [22, 24]
+        # Every supported line, always at its newest release (the agent refuses unpatched Node.js).
+        node: [22, 24, 26]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # Actions pinned to commit SHAs; Dependabot keeps them current.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ matrix.node }}
+          check-latest: true
           cache: npm
       - run: npm ci
       - run: make check
       - run: make audit
+      - run: npm audit signatures
 
   docker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: docker build -t llm-agent:ci .
       - name: Smoke test
         run: |
           docker run -d --name agent -p 127.0.0.1:8787:8787 llm-agent:ci
           for i in $(seq 1 20); do curl -fsS http://127.0.0.1:8787/healthz && exit 0; sleep 1; done
           docker logs agent; exit 1
+      - name: No npm, yarn or corepack in the runtime image
+        run: docker run --rm --entrypoint sh llm-agent:ci -c '! command -v npm && ! command -v yarn && ! command -v corepack'
