@@ -164,13 +164,13 @@ describe("web_fetch", () => {
       if (req.url === "/huge.png") return res.writeHead(200, { "content-type": "image/png", "content-length": String(50_000_000) }).end();
       // A cookie check: /check sends you to /set without its cookie, /set sets it and sends you back.
       if (req.url === "/check")
-        return /seen=1/.test(req.headers.cookie ?? "")
+        return /seen=1/.test(req.headers.cookie ?? "") && !/tls=/.test(req.headers.cookie ?? "") // no Secure cookie over http
           ? res
               .writeHead(200, { "content-type": "text/html" })
               .end(`<html><title>Checked</title><body><p>${"Cookie check passed. ".repeat(20)}</p></body></html>`)
           : res.writeHead(302, { location: "/set" }).end();
       if (req.url === "/set")
-        return res.writeHead(302, { location: "/check", "set-cookie": ["seen=1; Path=/", "other=1; Domain=evil.example"] }).end();
+        return res.writeHead(302, { location: "/check", "set-cookie": ["seen=1; Path=/", "wide=1; Domain=com", "tls=1; Secure"] }).end();
       if (req.url === "/cf")
         return res.writeHead(403, { "content-type": "text/html" }).end("<html><head><title>Just a moment...</title></head></html>");
       res.writeHead(404).end("nope");

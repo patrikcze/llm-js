@@ -163,14 +163,16 @@ async function safeFetch(
   const requested = url;
   const signal = AbortSignal.any([ctx.signal, AbortSignal.timeout(FETCH_TIMEOUT_MS)]);
   // Cookies set during this one fetch, sent back on its later redirect hops: consent and cookie-check
-  // redirects (set a cookie, then send you back) need that. Nothing is kept between fetches.
-  const jar = new Map<string, { domain: string; value: string }>();
+  // redirects (set a cookie, then send you back) need that. Nothing is kept between fetches. Cookies
+  // are host-only (a Domain attribute is ignored, so e.g. "Domain=com" cannot reach other sites) and
+  // Secure ones only go over https.
+  const jar = new Map<string, { host: string; secure: boolean; value: string }>();
   // Follow redirects by hand so every hop goes through the address check.
   for (let hop = 0; hop < 8; hop++) {
     await assertPublicUrl(url);
     const host = url.hostname.toLowerCase();
     const cookie = [...jar.entries()]
-      .filter(([, c]) => host === c.domain || host.endsWith(`.${c.domain}`))
+      .filter(([, c]) => c.host === host && (!c.secure || url.protocol === "https:"))
       .map(([key, c]) => `${key.slice(key.indexOf(" ") + 1)}=${c.value}`)
       .join("; ");
     let res: FetchResponse;
@@ -198,11 +200,9 @@ async function safeFetch(
       throw new ToolError(`Network error fetching ${url}: ${e.cause?.code ?? e.message}`);
     }
     for (const c of getSetCookies(res.headers as any)) {
-      const domain = (c.domain ?? host).replace(/^\./, "").toLowerCase();
-      if (host !== domain && !host.endsWith(`.${domain}`)) continue; // a cookie for another site: ignore
-      const key = `${domain} ${c.name}`;
+      const key = `${host} ${c.name}`;
       if (c.value === "" || (c.maxAge !== undefined && c.maxAge <= 0)) jar.delete(key);
-      else jar.set(key, { domain, value: c.value });
+      else jar.set(key, { host, secure: !!c.secure, value: c.value });
     }
     const location = res.headers.get("location");
     if (res.status >= 300 && res.status < 400 && location) {
