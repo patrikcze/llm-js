@@ -276,6 +276,23 @@ describe("OpenShell command runner", {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it("starts the server without a way to open Node's inspector (SIGUSR1, NODE_OPTIONS)", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "agent-runner-"));
+    try {
+      const probe = "console.log(JSON.stringify({ execArgv: process.execArgv, nodeOptions: process.env.NODE_OPTIONS ?? null }))";
+      const out = execFileSync(
+        "python3",
+        ["-I", RUNNER, "--no-landlock", "--socket", path.join(dir, "sock"), "--", process.execPath, "-e", probe],
+        { env: { ...process.env, NODE_OPTIONS: "--inspect=0" }, encoding: "utf8", timeout: 10_000 },
+      );
+      const seen = JSON.parse(out.trim().split("\n").at(-1)!);
+      assert.ok(seen.execArgv.includes("--disable-sigusr1"), out);
+      assert.equal(seen.nodeOptions, null);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("run_command permissions", () => {

@@ -134,11 +134,17 @@ async function assertPublicUrl(url: URL): Promise<void> {
 type FetchResponse = Awaited<ReturnType<typeof undiciFetch>>;
 
 /** What the model should tell the user when the OpenShell policy blocks a site. */
-function sandboxBlocked(url: URL): string {
+function sandboxBlocked(url: URL, requested: URL): string {
   const name = process.env.AGENT_SANDBOX_NAME || "<name>";
   const port = url.port || (url.protocol === "https:" ? "443" : "80");
+  // A redirect (e.g. to a consent or login page) is easy to mistake for the allowed site failing.
+  const blocked = `the sandbox's network policy does not allow ${url.hostname}:${port}`;
+  const what =
+    url.hostname === requested.hostname
+      ? `The ${blocked}.`
+      : `${requested.hostname} redirected to ${url.hostname} (often a consent or login page), and ${blocked}.`;
   return (
-    `The sandbox's network policy does not allow ${url.hostname}:${port}. Do not retry. ` +
+    `${what} Do not retry. ` +
     `Tell the user they can allow it with: make openshell-allow NAME=${name} HOST=${url.hostname}${port === "443" ? "" : ` PORT=${port}`}`
   );
 }
@@ -154,6 +160,7 @@ async function safeFetch(
   } catch {
     throw new ToolError(`Invalid URL: ${rawUrl}`);
   }
+  const requested = url;
   const signal = AbortSignal.any([ctx.signal, AbortSignal.timeout(FETCH_TIMEOUT_MS)]);
   // Follow redirects by hand so every hop goes through the address check.
   for (let hop = 0; hop < 6; hop++) {
@@ -172,7 +179,8 @@ async function safeFetch(
       if (e.name === "TimeoutError") throw new ToolError(`Timed out fetching ${url}`);
       if (e.name === "AbortError") throw e;
       if (e.cause?.code === "ERR_PRIVATE_ADDRESS") throw new ToolError(`Refusing to fetch ${url.hostname}: ${e.cause.message}.`);
-      if (inOpenShell() && ["EACCES", "ECONNRESET", "ECONNREFUSED"].includes(e.cause?.code)) throw new ToolError(sandboxBlocked(url));
+      if (inOpenShell() && ["EACCES", "ECONNRESET", "ECONNREFUSED"].includes(e.cause?.code))
+        throw new ToolError(sandboxBlocked(url, requested));
       throw new ToolError(`Network error fetching ${url}: ${e.cause?.code ?? e.message}`);
     }
     const location = res.headers.get("location");
