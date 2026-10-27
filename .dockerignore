@@ -19,4 +19,5 @@ coverage
 compose.docker.yml
 *.token
 .DS_Store
-openshell
+openshell/*
+!openshell/runner.py

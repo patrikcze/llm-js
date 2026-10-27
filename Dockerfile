@@ -34,6 +34,12 @@ RUN if [ "$WITH_NPM" != "true" ]; then \
 COPY src ./src
 COPY web ./web
 
+# OpenShell sandboxes only (make openshell-up): openshell/runner.py starts the server from a private copy of
+# node, the one program the sandbox policy lets onto the network, and runs the agent's commands outside its
+# process tree where they cannot execute that copy. Docker and Compose ignore both.
+COPY openshell/runner.py ./openshell/runner.py
+RUN mkdir -p /opt/llm-agent && cp /usr/local/bin/node /opt/llm-agent/node
+
 # Inside the container the server listens on all interfaces; compose publishes it on the
 # host's 127.0.0.1 only. Settings (provider, model, API keys) live in the /config volume.
 ENV HOST=0.0.0.0 \

@@ -27,6 +27,6 @@ export { loadSettings, type SavedSettings, saveSettings, settingsPath } from "./
 export { defaultTools } from "./tools/all.ts";
 export { localContextTool, timeInfo } from "./tools/context.ts";
 export { fsTools, resolveInWorkspace, sniffImage, viewImageTool } from "./tools/fs.ts";
-export { blockedReason, commandEnv, runCommandTool, runShell } from "./tools/shell.ts";
+export { blockedReason, commandEnv, commandRunner, runCommandTool, runShell } from "./tools/shell.ts";
 export * from "./tools/types.ts";
 export { htmlToMarkdown, searchProviderName, webFetchTool, webSearchTool, webTools } from "./tools/web.ts";

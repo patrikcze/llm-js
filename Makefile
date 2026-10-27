@@ -60,6 +60,9 @@ OPENSHELL        ?= openshell
 OPENSHELL_POLICY ?= openshell/policy.yaml
 SANDBOX          := llm-agent-$(NAME)
 HOST_LLM_PORT    ?= 9931
+# The server's own node binary in the image, the only program the policy lets onto the network. Commands
+# run through openshell/runner.py, outside the server's process tree, and cannot execute it.
+OS_SERVER_NODE   := /opt/llm-agent/node
 OS_FILE           = $(RUN_DIR)/openshell-$(NAME)
 # Copies the contents of directory $$ws into the sandbox's /workspace (an upload of the directory
 # itself would land in /workspace/<dirname>).
@@ -301,7 +304,7 @@ openshell-up: ## Start an agent in an OpenShell sandbox: make openshell-up NAME=
 	  --env "AGENT_OPEN_HINT=make openshell-open NAME=$(NAME)" \
 	  --env LLM_BASE_URL=http://host.openshell.internal:$(HOST_LLM_PORT)/v1 --env SEARXNG_URL=http://host.openshell.internal:8888 \
 	  --env-from AGENT_TOKEN \
-	  -- node /app/src/server.ts -w /workspace --mode $(MODE) $(if $(THINK),--think $(THINK),) >/dev/null \
+	  -- python3 -I /app/openshell/runner.py -- $(OS_SERVER_NODE) /app/src/server.ts -w /workspace --mode $(MODE) $(if $(THINK),--think $(THINK),) >/dev/null \
 	  || { echo "Could not create the sandbox (see above)." >&2; rm -f $(OS_FILE).token $(OS_FILE).port; exit 1; }; \
 	( $(os_upload) ) || { echo "Could not copy $$ws into the sandbox." >&2; exit 1; }; \
 	$(OPENSHELL) forward start -d 127.0.0.1:$$port $(SANDBOX) >/dev/null 2>&1 \
@@ -309,7 +312,7 @@ openshell-up: ## Start an agent in an OpenShell sandbox: make openshell-up NAME=
 	for i in $$(seq 1 60); do \
 	  if $(NODE) -e "fetch('http://127.0.0.1:$$port/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"; then \
 	    echo "Agent $(NAME) running in OpenShell sandbox $(SANDBOX) · workspace /workspace (synced from $$ws)"; \
-	    echo "Network: only your LLM (port $(HOST_LLM_PORT)) and SearXNG on this machine; every other host is denied."; \
+	    echo "Network: only your LLM (port $(HOST_LLM_PORT)) and SearXNG on this machine; every other host is denied. Commands the agent runs get no network."; \
 	    echo "Allow another site: make openshell-allow NAME=$(NAME) HOST=example.com · copy work out: make openshell-pull NAME=$(NAME)"; \
 	    echo "Open: http://127.0.0.1:$$port/?token=$$tok"; exit 0; fi; \
 	  sleep 0.5; \
@@ -347,8 +350,8 @@ openshell-open: ## Open a sandboxed agent's UI (restarts the port forward if nee
 
 openshell-allow: ## Let a sandboxed agent's web_fetch reach a site: make openshell-allow NAME=alpha HOST=docs.python.org [PORT=443]
 	@[ -n "$(NAME)" ] && [ -n "$(HOST)" ] && [ "$(HOST)" != "127.0.0.1" ] || { echo "Usage: make openshell-allow NAME=<name> HOST=<host> [PORT=443]" >&2; exit 2; }
-	@$(OPENSHELL) policy update $(SANDBOX) --add-endpoint $(HOST):$(if $(filter command line,$(origin PORT)),$(PORT),443) --binary /usr/local/bin/node --wait >/dev/null \
-	  && echo "$(SANDBOX): the agent (and commands it runs) may now reach $(HOST):$(if $(filter command line,$(origin PORT)),$(PORT),443)."
+	@$(OPENSHELL) policy update $(SANDBOX) --add-endpoint $(HOST):$(if $(filter command line,$(origin PORT)),$(PORT),443) --binary $(OS_SERVER_NODE) --wait >/dev/null \
+	  && echo "$(SANDBOX): the agent's web_fetch (not the commands it runs) may now reach $(HOST):$(if $(filter command line,$(origin PORT)),$(PORT),443)."
 
 openshell-logs: ## Show a sandboxed agent's logs (server and OpenShell decisions)
 	@[ -n "$(NAME)" ] || { echo "Usage: make openshell-logs NAME=<name>" >&2; exit 2; }

@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { realpathSync } from "node:fs";
 import { stat } from "node:fs/promises";
+import net from "node:net";
 import path from "node:path";
 import { resolveInWorkspace } from "./fs.ts";
 import { type Tool, type ToolContext, ToolError } from "./types.ts";
@@ -12,7 +14,9 @@ import { type Tool, type ToolContext, ToolError } from "./types.ts";
 //   1. Approval: risk "execute" is refused in read-only mode and asked in every other mode
 //      except "auto". "Always allow" covers one exact command line (see approvalKey).
 //   2. Isolation: run the agent in its container (`make agent-up`) and commands only see
-//      that container and its /workspace. On the host they run as your user.
+//      that container and its /workspace. On the host they run as your user. In an OpenShell
+//      sandbox they run through openshell/runner.py, outside the server's process tree, so they
+//      get no network access at all (see commandRunner).
 //   3. Hygiene: secrets are removed from the environment, stdin is closed, no TTY, pagers and
 //      credential prompts are disabled, the whole process group is killed on timeout/abort,
 //      and leftover background processes are stopped when the command ends.
@@ -114,37 +118,154 @@ export interface CommandResult {
   droppedBytes: number;
 }
 
+interface ShellEvents {
+  data: [chunk: Buffer];
+  exit: [code: number | null, signal: string | null];
+  close: [];
+  error: [error: Error];
+}
+
+/** A started shell: local, or in the OpenShell command runner. */
+interface ShellProcess extends EventEmitter<ShellEvents> {
+  /** Signals the shell's whole process group. */
+  killTree(sig: NodeJS.Signals): void;
+  /** Called once the result is in: stops whatever is left. */
+  release(): void;
+}
+
+type ShellOptions = { cwd: string; stdin?: string; env: Record<string, string> };
+
+function spawnLocal(command: string, opts: ShellOptions): ShellProcess {
+  const isWin = process.platform === "win32";
+  // POSIX: one pipe for both streams (exec 2>&1), so output keeps its real order.
+  const child = spawn(
+    isWin ? (process.env.ComSpec ?? "cmd.exe") : "/bin/sh",
+    isWin ? ["/d", "/s", "/c", command] : ["-c", `exec 2>&1\n${command}`],
+    {
+      cwd: opts.cwd,
+      env: opts.env,
+      // Own process group, so a timeout can stop the command and everything it started.
+      detached: !isWin,
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    },
+  );
+  const killTree = (sig: NodeJS.Signals) => {
+    if (child.pid === undefined) return;
+    try {
+      if (isWin) spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true });
+      else process.kill(-child.pid, sig);
+    } catch {
+      // already gone
+    }
+  };
+  const proc: ShellProcess = Object.assign(new EventEmitter<ShellEvents>(), { killTree, release: () => {} });
+  child.stdout.on("data", (c: Buffer) => proc.emit("data", c));
+  child.stderr.on("data", (c: Buffer) => proc.emit("data", c));
+  child.on("error", (e: NodeJS.ErrnoException) => proc.emit("error", new ToolError(`Could not start the shell: ${e.code ?? e.message}`)));
+  child.on("exit", (code, sig) => proc.emit("exit", code, sig));
+  child.on("close", () => proc.emit("close"));
+  child.stdin.on("error", () => {}); // the command may exit without reading stdin
+  if (opts.stdin) child.stdin.end(opts.stdin);
+  else child.stdin.end();
+  return proc;
+}
+
 /**
- * Runs `command` in a fresh shell with stdout and stderr interleaved as they arrive.
- * Kills the whole process group on timeout or abort; rejects with the abort reason on abort.
+ * Runs the command through openshell/runner.py, which is not a descendant of this server and so does not
+ * inherit its network allowlist. Protocol: see runner.py.
+ */
+function spawnInRunner(socketPath: string, command: string, opts: ShellOptions): ShellProcess {
+  const sock = net.createConnection(socketPath);
+  let exited = false;
+  let closed = false;
+  const send = (msg: object) => {
+    if (sock.writable) sock.write(`${JSON.stringify(msg)}\n`);
+  };
+  const proc: ShellProcess = Object.assign(new EventEmitter<ShellEvents>(), {
+    killTree: (sig: NodeJS.Signals) => send({ kill: sig }),
+    // Hanging up makes the runner kill the process group.
+    release: () => sock.destroy(),
+  });
+  // Like a local child, "close" (all output read) comes after "exit", whichever the runner reports first.
+  let eof = false;
+  const maybeClose = () => {
+    if (exited && eof && !closed) {
+      closed = true;
+      proc.emit("close");
+    }
+  };
+  const handle = (msg: { out?: string; exit?: number | null; signal?: string | null; eof?: boolean; error?: string }) => {
+    if (msg.out !== undefined) proc.emit("data", Buffer.from(msg.out, "base64"));
+    else if ("exit" in msg) {
+      exited = true;
+      proc.emit("exit", msg.exit ?? null, msg.signal ?? null);
+      maybeClose();
+    } else if (msg.eof) {
+      eof = true;
+      maybeClose();
+    } else if (msg.error) proc.emit("error", new ToolError(`Could not start the shell: ${msg.error}`));
+  };
+  let buf = "";
+  sock.setEncoding("utf8");
+  sock.on("connect", () => send({ command, cwd: opts.cwd, env: opts.env, stdin: opts.stdin ?? "" }));
+  sock.on("data", (text: string) => {
+    buf += text;
+    for (let i = buf.indexOf("\n"); i >= 0; i = buf.indexOf("\n")) {
+      const line = buf.slice(0, i);
+      buf = buf.slice(i + 1);
+      try {
+        handle(JSON.parse(line));
+      } catch {
+        // ignore a malformed line
+      }
+    }
+  });
+  sock.on("error", (e: NodeJS.ErrnoException) => {
+    if (!exited) proc.emit("error", new ToolError(`Could not reach the command runner: ${e.code ?? e.message}`));
+  });
+  sock.on("close", () => {
+    if (!exited) proc.emit("error", new ToolError("The command runner closed the connection"));
+    eof = true;
+    maybeClose();
+  });
+  return proc;
+}
+
+/**
+ * Where commands run. In an OpenShell sandbox they must go to the command runner (AGENT_COMMAND_SOCKET):
+ * started by this server they would share its network allowlist, so without a runner they are refused.
+ * Everywhere else (Docker, the host) they are spawned directly.
+ */
+export function commandRunner(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (env.OPENSHELL_SANDBOX !== "1") return undefined;
+  if (!env.AGENT_COMMAND_SOCKET)
+    throw new ToolError(
+      "Commands are disabled in this OpenShell sandbox: the command runner is not running (start the sandbox with make openshell-up).",
+    );
+  return env.AGENT_COMMAND_SOCKET;
+}
+
+/**
+ * Runs `command` in a fresh shell with stdout and stderr interleaved as they arrive, locally or through
+ * the command runner at `runner`. Kills the whole process group on timeout or abort; rejects with the
+ * abort reason on abort.
  */
 export function runShell(
   command: string,
-  opts: { cwd: string; timeoutMs: number; signal: AbortSignal; stdin?: string; env?: Record<string, string> },
+  opts: { cwd: string; timeoutMs: number; signal: AbortSignal; stdin?: string; env?: Record<string, string>; runner?: string },
 ): Promise<CommandResult> {
-  const isWin = process.platform === "win32";
   const started = Date.now();
   return new Promise((resolve, reject) => {
-    // POSIX: one pipe for both streams (exec 2>&1), so output keeps its real order.
-    const child = spawn(
-      isWin ? (process.env.ComSpec ?? "cmd.exe") : "/bin/sh",
-      isWin ? ["/d", "/s", "/c", command] : ["-c", `exec 2>&1\n${command}`],
-      {
-        cwd: opts.cwd,
-        env: opts.env ?? commandEnv(),
-        // Own process group, so a timeout can stop the command and everything it started.
-        detached: !isWin,
-        stdio: ["pipe", "pipe", "pipe"],
-        windowsHide: true,
-      },
-    );
+    const shellOpts = { cwd: opts.cwd, stdin: opts.stdin, env: opts.env ?? commandEnv() };
+    const child = opts.runner ? spawnInRunner(opts.runner, command, shellOpts) : spawnLocal(command, shellOpts);
 
     const head: Buffer[] = [];
     let headBytes = 0;
     let tail: Buffer[] = [];
     let tailBytes = 0;
     let droppedBytes = 0;
-    const collect = (chunk: Buffer) => {
+    child.on("data", (chunk: Buffer) => {
       if (headBytes < CAPTURE_BYTES) {
         head.push(chunk);
         headBytes += chunk.length;
@@ -157,24 +278,13 @@ export function runShell(
         tailBytes -= first.length;
         droppedBytes += first.length;
       }
-    };
-    child.stdout.on("data", collect);
-    child.stderr.on("data", collect);
+    });
 
     let timedOut = false;
     let settled = false;
-    const killTree = (sig: NodeJS.Signals) => {
-      if (child.pid === undefined) return;
-      try {
-        if (isWin) spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true });
-        else process.kill(-child.pid, sig);
-      } catch {
-        // already gone
-      }
-    };
     const stop = () => {
-      killTree("SIGTERM");
-      setTimeout(() => killTree("SIGKILL"), 2000).unref();
+      child.killTree("SIGTERM");
+      setTimeout(() => child.killTree("SIGKILL"), 2000).unref();
     };
     const timer = setTimeout(() => {
       timedOut = true;
@@ -191,7 +301,8 @@ export function runShell(
       clearTimeout(timer);
       opts.signal.removeEventListener("abort", onAbort);
       // Nothing the command started may outlive it.
-      killTree("SIGKILL");
+      child.killTree("SIGKILL");
+      child.release();
       if (opts.signal.aborted) return reject(opts.signal.reason ?? new Error("aborted"));
       const out =
         Buffer.concat(head).toString("utf8") +
@@ -201,12 +312,13 @@ export function runShell(
       resolve({ exitCode, signal: exitSignal, output: out.replace(ANSI, ""), timedOut, ms: Date.now() - started, droppedBytes });
     };
 
-    child.on("error", (e: NodeJS.ErrnoException) => {
+    child.on("error", (e) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       opts.signal.removeEventListener("abort", onAbort);
-      reject(new ToolError(`Could not start the shell: ${e.code ?? e.message}`));
+      child.release();
+      reject(e);
     });
     child.on("exit", (code, sig) => {
       exitCode = code;
@@ -215,10 +327,6 @@ export function runShell(
       setTimeout(finish, EXIT_GRACE_MS).unref();
     });
     child.on("close", finish);
-
-    child.stdin.on("error", () => {}); // the command may exit without reading stdin
-    if (opts.stdin) child.stdin.end(opts.stdin);
-    else child.stdin.end();
   });
 }
 
@@ -241,7 +349,7 @@ async function prepare({ command, cwd = ".", timeout_seconds = DEFAULT_TIMEOUT_S
   const dir = await resolveInWorkspace(ctx, cwd);
   if (!(await stat(dir).catch(() => null))?.isDirectory()) throw new ToolError(`cwd is not a directory: ${cwd}`);
   const timeout = Math.min(Math.max(timeout_seconds, 1), MAX_TIMEOUT_S);
-  return { dir, timeout, relDir: path.relative(realpathSync(ctx.workspace), dir) || "." };
+  return { dir, timeout, relDir: path.relative(realpathSync(ctx.workspace), dir) || ".", runner: commandRunner() };
 }
 
 export const runCommandTool: Tool<CommandArgs, string> = {
@@ -269,18 +377,20 @@ export const runCommandTool: Tool<CommandArgs, string> = {
     required: ["command"],
   },
   async describe(args, ctx) {
-    const { relDir, timeout } = await prepare(args, ctx);
+    const { relDir, timeout, runner } = await prepare(args, ctx);
     return {
       summary: `Run command: ${args.command.length > 80 ? `${args.command.slice(0, 79)}…` : args.command}`,
       preview:
         `$ ${args.command}\n\ncwd: ${relDir} · timeout: ${timeout}s${args.stdin ? ` · stdin: ${args.stdin.length} chars` : ""}\n` +
-        "Runs with this agent's user permissions (inside the container when the agent runs in Docker). " +
+        (runner
+          ? "Runs inside the OpenShell sandbox, without network access. "
+          : "Runs with this agent's user permissions (inside the container when the agent runs in Docker). ") +
         "API keys and other secret environment variables are hidden from it.",
     };
   },
   async run(args, ctx) {
-    const { dir, timeout, relDir } = await prepare(args, ctx);
-    const r = await runShell(args.command, { cwd: dir, timeoutMs: timeout * 1000, signal: ctx.signal, stdin: args.stdin });
+    const { dir, timeout, relDir, runner } = await prepare(args, ctx);
+    const r = await runShell(args.command, { cwd: dir, timeoutMs: timeout * 1000, signal: ctx.signal, stdin: args.stdin, runner });
     const how = r.timedOut
       ? `timed out after ${timeout}s (process group killed)`
       : r.signal

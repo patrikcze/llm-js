@@ -11,6 +11,7 @@ filesystem_policy:
   include_workdir: true # /workspace, the image's working directory
   read_only:
     - /app # the agent's code and dependencies
+    - /opt/llm-agent # the server's own node (the only program with network access)
     - /bin
     - /usr
     - /lib
@@ -27,11 +28,14 @@ filesystem_policy:
 landlock:
   compatibility: best_effort
 
-# Live-updatable. Network access is allowed for the agent server (node) and, because OpenShell
-# matches a program *or any of its parent processes*, also for commands the agent runs (they are
-# children of node). Everything else is denied: no other hosts, nothing on the host machine but
-# these two ports. host.openshell.internal is the machine running the gateway. web_fetch itself
-# refuses internal names, so pages cannot steer it at these host services.
+# Live-updatable. Network access is allowed for the agent server only: /opt/llm-agent/node, a private
+# copy of node in the image. OpenShell matches a program *or any of its parent processes* by exact
+# path, so the commands the agent runs get no network at all: openshell/runner.py (the sandbox's entry
+# point) starts them outside the server's process tree, and forbids them to execute /opt/llm-agent/node
+# (Landlock). They can still run /usr/local/bin/node, which no rule names.
+# Everything else is denied: no other hosts, nothing on the host machine but these two ports.
+# host.openshell.internal is the machine running the gateway. web_fetch itself refuses internal names,
+# so pages cannot steer it at these host services.
 network_policies:
   local_llm:
     name: Local LLM server (llama.cpp / Ollama / LM Studio on the host)
@@ -39,11 +43,11 @@ network_policies:
       - host: host.openshell.internal
         port: 9931
     binaries:
-      - path: /usr/local/bin/node
+      - path: /opt/llm-agent/node
   searxng:
     name: SearXNG on the host (make search-up)
     endpoints:
       - host: host.openshell.internal
         port: 8888
     binaries:
-      - path: /usr/local/bin/node
+      - path: /opt/llm-agent/node
