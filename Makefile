@@ -55,6 +55,17 @@ LIMITS      ?= --pids-limit 512 --memory 2g --cpus 2
 HARDENING   := --read-only --tmpfs /tmp --tmpfs /home/node:mode=1777 \
                --cap-drop ALL --security-opt no-new-privileges $(LIMITS)
 
+# OpenShell sandboxes (make openshell-up NAME=…): the agent image under an OpenShell policy.
+OPENSHELL        ?= openshell
+OPENSHELL_POLICY ?= openshell/policy.yaml
+SANDBOX          := llm-agent-$(NAME)
+HOST_LLM_PORT    ?= 9931
+OS_FILE           = $(RUN_DIR)/openshell-$(NAME)
+# Copies the contents of directory $$ws into the sandbox's /workspace (an upload of the directory
+# itself would land in /workspace/<dirname>).
+os_upload = for f in "$$ws"/* "$$ws"/.[!.]* "$$ws"/..?*; do [ -e "$$f" ] || continue; \
+  $(OPENSHELL) sandbox upload --no-git-ignore $(SANDBOX) "$$f" /workspace >/dev/null 2>&1 || exit 1; done
+
 RUN_DIR   := .run
 PID_FILE  := $(RUN_DIR)/server.pid
 TOKEN_FILE := $(RUN_DIR)/server.token
@@ -84,6 +95,7 @@ port_free = { $(NODE) -e "const s=require('net').createServer().once('error',()=
         check ci lint fix format format-check typecheck test test-watch coverage audit \
         docker-build docker-scan docker-up docker-down docker-restart docker-logs docker-ps docker-shell search-up search-down \
         agent-up agent-down agent-cleanup agent-open agents agent-logs agent-shell docker-open searxng-attach \
+        openshell-up openshell-down openshell-open openshell-allow openshell-logs openshell-pull openshell-push openshell-list \
         clean distclean
 
 ##@ General
@@ -265,6 +277,86 @@ searxng-attach:
 search-down: ## Stop SearXNG
 	$(COMPOSE) stop searxng
 
+##@ OpenShell sandboxes (policy-enforced; see openshell/policy.yaml)
+
+openshell-up: ## Start an agent in an OpenShell sandbox: make openshell-up NAME=alpha [AGENT_PORT=8801] [AGENT_WS=dir]
+	@[ -n "$(NAME)" ] || { echo "Usage: make openshell-up NAME=<name> [AGENT_PORT=8801] [AGENT_WS=dir] [MODE=...]" >&2; exit 2; }
+	@case "$(NAME)" in *[!a-zA-Z0-9-]*) echo "NAME may only contain letters, digits and -" >&2; exit 2;; esac
+	@command -v $(OPENSHELL) >/dev/null || { echo "OpenShell CLI not found: https://github.com/NVIDIA/OpenShell" >&2; exit 1; }
+	@$(OPENSHELL) status >/dev/null 2>&1 || { echo "No OpenShell gateway is reachable: brew services start openshell (see make doctor / openshell doctor)" >&2; exit 1; }
+	@if $(OPENSHELL) sandbox get $(SANDBOX) >/dev/null 2>&1; then \
+	  echo "Sandbox $(SANDBOX) already exists. Open it: make openshell-open NAME=$(NAME), or remove it: make openshell-down NAME=$(NAME)" >&2; exit 1; fi
+	@$(DOCKER) image inspect $(AGENT_IMAGE) >/dev/null 2>&1 || $(COMPOSE) build agent
+	@$(COMPOSE) up -d searxng >/dev/null 2>&1 || echo "SearXNG did not start; web_search will be unavailable." >&2
+	@mkdir -p $(RUN_DIR) "$(AGENT_WS)"
+	@tok=$$($(gen_token)); (umask 077; echo $$tok > $(OS_FILE).token); \
+	port="$(AGENT_PORT)"; \
+	[ -n "$$port" ] || port=$$($(NODE) -e "const s=require('net').createServer().listen(0,'127.0.0.1',()=>{console.log(s.address().port);s.close()})"); \
+	echo $$port > $(OS_FILE).port; \
+	ws=$$(cd "$(AGENT_WS)" && pwd); \
+	AGENT_TOKEN=$$tok $(OPENSHELL) sandbox create --name $(SANDBOX) --from $(AGENT_IMAGE) --policy $(OPENSHELL_POLICY) \
+	  --no-auto-providers --no-tty --detach --restart-policy on-failure --no-credential-warnings \
+	  --label app=llm-agent --label llm-agent.name=$(NAME) \
+	  --env HOST=127.0.0.1 --env PORT=$$port --env TZ=$(TZ) --env AGENT_SANDBOX_NAME=$(NAME) \
+	  --env "AGENT_OPEN_HINT=make openshell-open NAME=$(NAME)" \
+	  --env LLM_BASE_URL=http://host.openshell.internal:$(HOST_LLM_PORT)/v1 --env SEARXNG_URL=http://host.openshell.internal:8888 \
+	  --env-from AGENT_TOKEN \
+	  -- node /app/src/server.ts -w /workspace --mode $(MODE) $(if $(THINK),--think $(THINK),) >/dev/null \
+	  || { echo "Could not create the sandbox (see above)." >&2; rm -f $(OS_FILE).token $(OS_FILE).port; exit 1; }; \
+	( $(os_upload) ) || { echo "Could not copy $$ws into the sandbox." >&2; exit 1; }; \
+	$(OPENSHELL) forward start -d 127.0.0.1:$$port $(SANDBOX) >/dev/null 2>&1 \
+	  || { echo "Could not forward port $$port to the sandbox." >&2; exit 1; }; \
+	for i in $$(seq 1 60); do \
+	  if $(NODE) -e "fetch('http://127.0.0.1:$$port/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"; then \
+	    echo "Agent $(NAME) running in OpenShell sandbox $(SANDBOX) · workspace /workspace (synced from $$ws)"; \
+	    echo "Network: only your LLM (port $(HOST_LLM_PORT)) and SearXNG on this machine; every other host is denied."; \
+	    echo "Allow another site: make openshell-allow NAME=$(NAME) HOST=example.com · copy work out: make openshell-pull NAME=$(NAME)"; \
+	    echo "Open: http://127.0.0.1:$$port/?token=$$tok"; exit 0; fi; \
+	  sleep 0.5; \
+	done; \
+	echo "Agent did not become healthy. Logs: make openshell-logs NAME=$(NAME)" >&2; exit 1
+
+openshell-down: ## Copy the sandbox's workspace to AGENT_WS, then delete the sandbox: make openshell-down NAME=alpha
+	@[ -n "$(NAME)" ] || { echo "Usage: make openshell-down NAME=<name>" >&2; exit 2; }
+	@if ! $(OPENSHELL) sandbox get $(SANDBOX) >/dev/null 2>&1; then \
+	  echo "No OpenShell sandbox named $(SANDBOX)."; rm -f $(OS_FILE).token $(OS_FILE).port; exit 0; fi; \
+	$(MAKE) --no-print-directory openshell-pull NAME=$(NAME) \
+	  || { echo "Could not copy the workspace out; keeping the sandbox. Force: openshell sandbox delete $(SANDBOX)" >&2; exit 1; }; \
+	[ -s $(OS_FILE).port ] && $(OPENSHELL) forward stop $$(cat $(OS_FILE).port) $(SANDBOX) >/dev/null 2>&1; \
+	$(OPENSHELL) sandbox delete $(SANDBOX) >/dev/null && echo "Deleted sandbox $(SANDBOX). Its workspace is in $(AGENT_WS)."; \
+	rm -f $(OS_FILE).token $(OS_FILE).port
+
+openshell-pull: ## Copy the sandbox's /workspace into AGENT_WS (default workspaces/NAME)
+	@[ -n "$(NAME)" ] || { echo "Usage: make openshell-pull NAME=<name> [AGENT_WS=dir]" >&2; exit 2; }
+	@mkdir -p "$(AGENT_WS)"
+	@$(OPENSHELL) sandbox download $(SANDBOX) /workspace "$(AGENT_WS)" >/dev/null && echo "Copied /workspace of $(SANDBOX) to $(AGENT_WS)."
+
+openshell-push: ## Copy AGENT_WS into the sandbox's /workspace
+	@[ -n "$(NAME)" ] || { echo "Usage: make openshell-push NAME=<name> [AGENT_WS=dir]" >&2; exit 2; }
+	@ws="$(AGENT_WS)"; ( $(os_upload) ) && echo "Copied $(AGENT_WS) into /workspace of $(SANDBOX)." \
+	  || { echo "Could not copy $(AGENT_WS) into the sandbox." >&2; exit 1; }
+
+openshell-open: ## Open a sandboxed agent's UI (restarts the port forward if needed)
+	@[ -n "$(NAME)" ] || { echo "Usage: make openshell-open NAME=<name>" >&2; exit 2; }
+	@[ -s $(OS_FILE).port ] && [ -s $(OS_FILE).token ] || { echo "No sandboxed agent named $(NAME) started from here." >&2; exit 1; }
+	@port=$$(cat $(OS_FILE).port); \
+	$(NODE) -e "fetch('http://127.0.0.1:$$port/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))" \
+	  || $(OPENSHELL) forward start -d 127.0.0.1:$$port $(SANDBOX) >/dev/null 2>&1; \
+	u="http://127.0.0.1:$$port/?token=$$(cat $(OS_FILE).token)"; \
+	command -v open >/dev/null && open "$$u" || xdg-open "$$u" >/dev/null 2>&1 || echo "$$u"
+
+openshell-allow: ## Let a sandboxed agent's web_fetch reach a site: make openshell-allow NAME=alpha HOST=docs.python.org [PORT=443]
+	@[ -n "$(NAME)" ] && [ -n "$(HOST)" ] && [ "$(HOST)" != "127.0.0.1" ] || { echo "Usage: make openshell-allow NAME=<name> HOST=<host> [PORT=443]" >&2; exit 2; }
+	@$(OPENSHELL) policy update $(SANDBOX) --add-endpoint $(HOST):$(if $(filter command line,$(origin PORT)),$(PORT),443) --binary /usr/local/bin/node --wait >/dev/null \
+	  && echo "$(SANDBOX): the agent (and commands it runs) may now reach $(HOST):$(if $(filter command line,$(origin PORT)),$(PORT),443)."
+
+openshell-logs: ## Show a sandboxed agent's logs (server and OpenShell decisions)
+	@[ -n "$(NAME)" ] || { echo "Usage: make openshell-logs NAME=<name>" >&2; exit 2; }
+	$(OPENSHELL) logs $(SANDBOX)
+
+openshell-list: ## List OpenShell sandboxes
+	$(OPENSHELL) sandbox list
+
 ##@ Isolated agents (one container + workspace each)
 
 agent-up: ## Start an isolated agent: make agent-up NAME=alpha [AGENT_PORT=8801] [AGENT_WS=dir]
@@ -289,7 +381,7 @@ agent-up: ## Start an isolated agent: make agent-up NAME=alpha [AGENT_PORT=8801]
 	  -e LLM_BASE_URL=$${DOCKER_LLM_BASE_URL:-http://host.docker.internal:9931/v1} -e SEARXNG_URL=http://searxng:8080 -e TZ=$(TZ) \
 	  $(if $(filter docker,$(ENGINE)),--add-host host.docker.internal:host-gateway) \
 	  -v "$$ws":/workspace -v $(CONTAINER)-config:/config \
-	  $(HARDENING) $(AGENT_IMAGE) node src/server.ts -w /workspace --mode $(MODE) $(if $(THINK),--think $(THINK),) >/dev/null || { $(MAKE) --no-print-directory agent-cleanup NAME=$(NAME); exit 1; }; \
+	  $(HARDENING) $(AGENT_IMAGE) node /app/src/server.ts -w /workspace --mode $(MODE) $(if $(THINK),--think $(THINK),) >/dev/null || { $(MAKE) --no-print-directory agent-cleanup NAME=$(NAME); exit 1; }; \
 	for i in $$(seq 1 60); do \
 	  if $(NODE) -e "fetch('http://127.0.0.1:$$port/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"; then \
 	    echo "Agent $(NAME) running · workspace $$ws · container $(CONTAINER) · network $(NET)"; \

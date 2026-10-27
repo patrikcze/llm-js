@@ -1,0 +1,49 @@
+# OpenShell sandbox policy for llm-agent (make openshell-up NAME=…).
+#
+# OpenShell enforces this outside the agent: kernel-level filesystem rules (Landlock) and a proxy
+# that denies every outgoing connection unless a rule below allows it for that program.
+# Network rules can be changed on a live sandbox: openshell policy update <sandbox> ...
+# Requests that are denied become pending rules you can approve: openshell rule get <sandbox> --status pending
+version: 1
+
+# Static (fixed when the sandbox starts).
+filesystem_policy:
+  include_workdir: true # /workspace, the image's working directory
+  read_only:
+    - /app # the agent's code and dependencies
+    - /bin
+    - /usr
+    - /lib
+    - /etc
+    - /proc
+    - /dev/urandom
+    - /var/log
+  read_write:
+    - /workspace
+    - /config # provider/model settings
+    - /home/node
+    - /tmp
+    - /dev/null
+landlock:
+  compatibility: best_effort
+
+# Live-updatable. Network access is allowed for the agent server (node) and, because OpenShell
+# matches a program *or any of its parent processes*, also for commands the agent runs (they are
+# children of node). Everything else is denied: no other hosts, nothing on the host machine but
+# these two ports. host.openshell.internal is the machine running the gateway. web_fetch itself
+# refuses internal names, so pages cannot steer it at these host services.
+network_policies:
+  local_llm:
+    name: Local LLM server (llama.cpp / Ollama / LM Studio on the host)
+    endpoints:
+      - host: host.openshell.internal
+        port: 9931
+    binaries:
+      - path: /usr/local/bin/node
+  searxng:
+    name: SearXNG on the host (make search-up)
+    endpoints:
+      - host: host.openshell.internal
+        port: 8888
+    binaries:
+      - path: /usr/local/bin/node

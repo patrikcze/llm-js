@@ -49,6 +49,7 @@ Run `make` to list everything. Targets that need Node dependencies (`start`, `ch
 | `make docker-up` / `docker-open` / `docker-down` / `docker-logs` | The default Docker agent + SearXNG. With `NAME=…`, `docker-up` starts an isolated agent instead (same as `agent-up`). It takes `AGENT_PORT`, not `PORT` |
 | `make search-up` | Only SearXNG, for running the agent with Node |
 | `make agent-up NAME=alpha` / `agent-open` / `agent-down` / `agents` / `agent-logs` / `agent-shell` | Isolated agents, each in its own hardened container with its own workspace, settings and token |
+| `make openshell-up NAME=alpha` / `openshell-open` / `openshell-allow` / `openshell-pull` / `openshell-push` / `openshell-down` | An agent in an [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell) sandbox: policy-enforced files and network (see [OpenShell sandboxes](#openshell-sandboxes)) |
 
 Every setting can be overridden: `make start PORT=8800 WORKSPACE=~/code/project MODE=auto-edit MODEL=…`. It works with macOS's GNU Make 3.81. The npm scripts (`npm run check`, `npm run lint`, …) mirror the main targets.
 
@@ -181,6 +182,28 @@ Every agent container (compose or `agent-up`) is hardened:
 
 Containers get your machine's time zone (`TZ`), so "local time" means yours. The image includes bash, git, curl, jq, python3, ripgrep and make for the agent's commands. It has no npm, npx, yarn or corepack: the agent doesn't need them, and npm bundles its own outdated copies of libraries with open advisories. For an agent that should install packages, build with `make docker-build WITH_NPM=true` (also works with `docker-up` and `agent-up`).
 
+## OpenShell sandboxes
+
+[NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell) runs the same agent image under a policy that is enforced outside the agent: kernel-level filesystem rules and a proxy that denies every outgoing connection the policy does not allow. Its gateway runs on macOS (Apple Silicon), Linux and WSL 2 on top of Docker or Podman; no NVIDIA GPU is needed.
+
+```bash
+brew install nvidia/openshell/openshell && brew services start openshell   # once; see OpenShell's docs for Linux
+make openshell-up NAME=research          # prints "Open: http://127.0.0.1:<port>/?token=…"
+make openshell-allow NAME=research HOST=docs.python.org
+make openshell-down NAME=research        # copies /workspace to workspaces/research, then deletes the sandbox
+```
+
+What [openshell/policy.yaml](openshell/policy.yaml) allows:
+
+- **Files:** the agent's code (`/app`) and system directories read-only; `/workspace`, `/config`, home and `/tmp` writable. Nothing of your machine is mounted.
+- **Network:** only your LLM server (`host.openshell.internal:9931`, change with `HOST_LLM_PORT` and in the policy) and SearXNG on this machine (`make openshell-up` starts it). Every other host is denied, for the agent server and for commands it runs.
+- **Opening more:** `web_fetch` tells the model when the policy blocks a site, with the exact `make openshell-allow …` command to give the user. Allowed hosts apply at once, without a restart. OpenShell matches a program *or any of its parent processes*, so commands the agent runs (children of the server) get the same allowlist as the server: much tighter than Docker, where they can reach the whole internet, but not none.
+- **web_fetch and the host:** inside the sandbox every name resolves to an address from `198.18.0.0/15` that OpenShell's proxy maps to the real destination; the SSRF guard accepts those for public names only and refuses internal names such as `host.openshell.internal`, so a web page cannot steer the agent at the services on your machine.
+
+The workspace lives inside the sandbox: `openshell-up` copies `AGENT_WS` (default `workspaces/<name>`) in, `openshell-pull` / `openshell-push` copy it out and in, and `openshell-down` copies it out before deleting the sandbox. API keys passed with `--env` would be visible inside the sandbox, so `.env` is not passed; hosted providers are best added as [OpenShell providers](https://docs.nvidia.com/openshell/latest/how-it-works/inference), which inject the key outside the sandbox.
+
+On macOS with Docker Desktop, sandboxes reach the gateway through host networking: enable it under Settings → Resources → Network, or sandboxes fail with `ControlSupervisorStartFailed`.
+
 ## Running commands safely
 
 `run_command` runs `/bin/sh -c <command>` in the workspace and returns the combined output and exit code. A non-zero exit is reported as an error, with the output. The protections, strongest first:
@@ -275,7 +298,7 @@ A plain `new OpenAI({ baseURL, apiKey })` client is accepted too. Adding a tool 
 ## Development
 
 ```bash
-make check           # lint + format check, types, 98 tests (no model or network needed)
+make check           # lint + format check, types, 100 tests (no model or network needed)
 make coverage
 ```
 

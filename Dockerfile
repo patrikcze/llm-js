@@ -10,11 +10,12 @@ ENV NODE_ENV=production
 WORKDIR /app
 
 # Alpine security updates first, then the tools for the agent's run_command (it executes inside this
-# container) and for grep (ripgrep). The npm bundled with Node lags behind on its own dependencies,
+# container) and for grep (ripgrep). uutils-coreutils (GNU-compatible, unlike BusyBox) lets OpenShell copy files in and out;
+# GNU coreutils would do too, but carries advisories without fixes. The npm bundled with Node lags behind on its own dependencies,
 # so it is updated; yarn 1 and corepack are unmaintained or unused here and are removed.
 ARG NPM_VERSION=12.2.1
 RUN apk upgrade --no-cache \
- && apk add --no-cache bash git curl jq python3 ripgrep make tzdata \
+ && apk add --no-cache bash git curl jq python3 ripgrep make tzdata uutils-coreutils \
  && npm install -g --ignore-scripts npm@${NPM_VERSION} \
  && rm -rf /opt/yarn-* /usr/local/bin/yarn /usr/local/bin/yarnpkg \
            /usr/local/lib/node_modules/corepack /usr/local/bin/corepack \
@@ -41,9 +42,12 @@ ENV HOST=0.0.0.0 \
 RUN mkdir -p /workspace /config && chown node:node /workspace /config
 USER node
 
-VOLUME ["/workspace", "/config"]
+# The working directory is the agent's workspace, owned by the agent's user. OpenShell sandboxes
+# require a writable working directory, and Compose / make agent-up mount /workspace and /config
+# explicitly (no VOLUME declaration: in OpenShell it would hide the working directory).
+WORKDIR /workspace
 EXPOSE 8787
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
   CMD node -e "fetch('http://127.0.0.1:8787/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
-CMD ["node", "src/server.ts", "-w", "/workspace"]
+CMD ["node", "/app/src/server.ts", "-w", "/workspace"]
