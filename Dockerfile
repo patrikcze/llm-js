@@ -4,7 +4,7 @@
 # Base image pinned to a patched Node.js release (24.22.1 fixes CVE-2026-111497, the Brotli decoder
 # RCE, among others) and to its digest, so a rebuild cannot silently pick up a different image.
 # Dependabot proposes updates (.github/dependabot.yml). Check what's inside: make docker-scan.
-FROM docker.io/library/node:24.22.1-alpine3.24@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53
+FROM docker.io/library/node:26.12.1-alpine3.24@sha256:40cd011b55415bc894e45b02fdd5a5dfde056921b7d23a64c74f80497af48797
 
 ENV NODE_ENV=production
 WORKDIR /app
