@@ -6,9 +6,12 @@ import { styleText } from "node:util";
 import { Agent, type ApprovalRequest, approvalKey, type PermissionMode, type RunResult, type UserInput } from "./agent.ts";
 import { COMMON_HELP, COMMON_OPTIONS, ConfigError, MODES, parseArgs, resolveConfig, THINKING } from "./config.ts";
 import type { ThinkingMode } from "./providers.ts";
+import { requirePatchedNode } from "./runtime.ts";
 import { defaultTools } from "./tools/all.ts";
 import { sniffImage } from "./tools/fs.ts";
 import { searchProviderName } from "./tools/web.ts";
+
+requirePatchedNode();
 
 const HELP = `llm-agent: an agent with filesystem, web search and web fetch tools for any OpenAI-compatible server.
 

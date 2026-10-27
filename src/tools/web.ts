@@ -128,7 +128,8 @@ async function safeFetch(
         redirect: "manual",
         signal,
         dispatcher,
-        headers: { "User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9", ...init.headers },
+        // No Brotli from arbitrary servers: defense in depth for decoder bugs like CVE-2026-111497.
+        headers: { "User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9", "Accept-Encoding": "gzip, deflate", ...init.headers },
       });
     } catch (e: any) {
       if (e.name === "TimeoutError") throw new ToolError(`Timed out fetching ${url}`);

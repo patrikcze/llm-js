@@ -47,7 +47,13 @@ console.log(paint(1, "llm-agent doctor"));
 // --- runtime -------------------------------------------------------------------
 const [major = 0, minor = 0] = process.versions.node.split(".").map(Number);
 const nodeOk = major > 22 || (major === 22 && minor >= 18);
-report(nodeOk ? "ok" : "fail", "Node.js", `${process.version}${nodeOk ? "" : " (need >= 22.18 for TypeScript type stripping)"}`);
+const { nodeSecurityIssue } = await import("../src/runtime.ts");
+const nodeIssue = nodeOk ? nodeSecurityIssue() : undefined;
+report(
+  nodeOk && !nodeIssue ? "ok" : "fail",
+  "Node.js",
+  `${process.version}${nodeOk ? (nodeIssue ? ` (${nodeIssue})` : "") : " (need >= 22.18 for TypeScript type stripping)"}`,
+);
 
 const deps = ["openai", "@anthropic-ai/sdk", "undici", "katex", "mermaid"].filter(
   (d) => !existsSync(path.join(ROOT, "node_modules", d, "package.json")),

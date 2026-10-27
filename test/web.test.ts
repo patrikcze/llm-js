@@ -64,8 +64,10 @@ describe("isPrivateAddress", () => {
 describe("web_fetch", () => {
   let server: ReturnType<typeof createServer>;
   let base = "";
+  const encodings: string[] = [];
   before(async () => {
     server = createServer((req, res) => {
+      encodings.push(String(req.headers["accept-encoding"]));
       if (req.url === "/page") return res.writeHead(200, { "content-type": "text/html" }).end(ARTICLE);
       if (req.url === "/json") return res.writeHead(200, { "content-type": "application/json" }).end('{"a":1}');
       if (req.url === "/redirect") return res.writeHead(302, { location: "/page" }).end();
@@ -93,6 +95,8 @@ describe("web_fetch", () => {
       `http://[64:ff9b::7f00:1]:${port}/page`,
       `http://2130706433:${port}/page`, // decimal 127.0.0.1
       `http://0x7f.1:${port}/page`,
+      `http://0177.0.0.1:${port}/page`, // octal (leading zero) 127.0.0.1
+      `http://127.1:${port}/page`,
       `http://0.0.0.0:${port}/page`,
       `http://localhost:${port}/page`,
     ])
@@ -133,6 +137,8 @@ describe("web_fetch", () => {
       assert.match(await webFetchTool.run({ url: `${base}/json` }, ctx), /"a": 1/);
       await assert.rejects(webFetchTool.run({ url: `${base}/missing` }, ctx), /HTTP 404/);
       await assert.rejects(webFetchTool.run({ url: `${base}/bin` }, ctx), /Unsupported content type/);
+      // Never asks arbitrary servers for Brotli (defense in depth for decoder bugs).
+      assert.ok(encodings.length > 0 && encodings.every((e) => e === "gzip, deflate"), encodings.join(" | "));
     } finally {
       delete process.env.AGENT_ALLOW_PRIVATE_FETCH;
     }

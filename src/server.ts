@@ -23,10 +23,13 @@ import { fileURLToPath } from "node:url";
 import { Agent, type ApprovalRequest, approvalKey, type PermissionMode, type UserInput } from "./agent.ts";
 import { COMMON_HELP, COMMON_OPTIONS, ConfigError, MODES, parseArgs, resolveConfig, THINKING } from "./config.ts";
 import { createChatClient, PROVIDERS, ProviderError, type ProviderKind } from "./providers.ts";
+import { requirePatchedNode } from "./runtime.ts";
 import { loadSettings, publicProviders, type SavedSettings, saveSettings, settingsPath } from "./settings.ts";
 import { defaultTools } from "./tools/all.ts";
 import { ToolError } from "./tools/types.ts";
 import { fetchImage, searchProviderName } from "./tools/web.ts";
+
+requirePatchedNode();
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
