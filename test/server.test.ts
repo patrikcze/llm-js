@@ -9,7 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, before, describe, it } from "node:test";
 
-const TOKEN = "t".repeat(8) + "secret-token-for-tests";
+const TOKEN = `${"t".repeat(8)}secret-token-for-tests`;
 // The session cookie is named after the token (hashed), never the port: every Docker agent listens on
 // 8787 inside its container, and a port-based name made two agents in one browser overwrite each other.
 const COOKIE = `agent_session_${createHash("sha256").update(TOKEN).digest("hex").slice(0, 16)}`;

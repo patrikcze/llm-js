@@ -70,8 +70,8 @@ const SECRET_VALUE = new RegExp(
   [
     String.raw`^[a-z][a-z0-9+.-]*://[^/\s:@]*:[^/\s@]+@`,
     String.raw`^(gh[pousr]_|github_pat_|glpat-|xox[abprs]-|sk-|sk_live_|rk_live_|pk_live_|AKIA|ASIA|AIza|npm_|hf_|ya29\.|eyJ[A-Za-z0-9_-]{8,}\.)`,
-    String.raw`^-----BEGIN [A-Z ]*PRIVATE KEY`,
-    String.raw`^[A-Za-z0-9_+=-]{40,}$`,
+    "^-----BEGIN [A-Z ]*PRIVATE KEY",
+    "^[A-Za-z0-9_+=-]{40,}$",
   ].join("|"),
 );
 
