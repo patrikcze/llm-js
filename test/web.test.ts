@@ -2,7 +2,15 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, before, describe, it } from "node:test";
-import { fetchImage, guardedLookup, htmlToMarkdown, isPrivateAddress, webFetchTool } from "../src/tools/web.ts";
+import {
+  fetchImage,
+  guardedLookup,
+  htmlToMarkdown,
+  isInternalHostname,
+  isPrivateAddress,
+  isRefusedAddress,
+  webFetchTool,
+} from "../src/tools/web.ts";
 
 const ctx = { workspace: process.cwd(), signal: new AbortController().signal };
 
@@ -58,6 +66,38 @@ describe("isPrivateAddress", () => {
     delete process.env.AGENT_ALLOW_PRIVATE_FETCH;
     const err = await new Promise<any>((resolve) => guardedLookup("localhost", {}, (e) => resolve(e)));
     assert.equal(err?.code, "ERR_PRIVATE_ADDRESS");
+  });
+
+  it("refuses internal host names whatever they resolve to", () => {
+    for (const h of [
+      "localhost",
+      "api.localhost",
+      "host.openshell.internal",
+      "host.docker.internal",
+      "printer.local",
+      "router.lan",
+      "intranet",
+      "nas.home.arpa",
+    ])
+      assert.equal(isInternalHostname(h), true, h);
+    for (const h of ["nodejs.org", "example.com", "1.1.1.1", "[2606:4700::1111]", "docs.internal-tools.com"])
+      assert.equal(isInternalHostname(h), false, h);
+  });
+
+  it("inside OpenShell, accepts proxy-mapped 198.18.0.0/15 answers for public names only", () => {
+    const before = process.env.OPENSHELL_SANDBOX;
+    try {
+      delete process.env.OPENSHELL_SANDBOX;
+      assert.equal(isRefusedAddress("nodejs.org", "198.18.0.5"), true); // outside OpenShell: reserved range
+      process.env.OPENSHELL_SANDBOX = "1";
+      assert.equal(isRefusedAddress("nodejs.org", "198.18.0.5"), false);
+      assert.equal(isRefusedAddress("198.18.0.5", "198.18.0.5"), true); // literal IPs never
+      assert.equal(isRefusedAddress("nodejs.org", "10.0.0.1"), true); // other private ranges still refused
+      assert.equal(isRefusedAddress("nodejs.org", "127.0.0.1"), true);
+    } finally {
+      if (before === undefined) delete process.env.OPENSHELL_SANDBOX;
+      else process.env.OPENSHELL_SANDBOX = before;
+    }
   });
 });
 

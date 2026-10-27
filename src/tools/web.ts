@@ -62,6 +62,28 @@ export function isPrivateAddress(ip: string): boolean {
 
 const privateFetchAllowed = () => process.env.AGENT_ALLOW_PRIVATE_FETCH === "1";
 
+// Inside an OpenShell sandbox, DNS answers every name with an address from 198.18.0.0/15 that the
+// sandbox's proxy maps back to the real destination; the proxy resolves the name itself and only
+// connects where the sandbox policy allows. Those answers are fine for public names. Internal names
+// (host.openshell.internal reaches the host machine) are refused by name, so this never opens them.
+const inOpenShell = () => process.env.OPENSHELL_SANDBOX === "1";
+const PROXY_MAPPED = new BlockList();
+PROXY_MAPPED.addSubnet("198.18.0.0", 15, "ipv4");
+
+/** Names that point at the local machine or network, whatever they resolve to. */
+export function isInternalHostname(hostname: string): boolean {
+  const h = hostname.toLowerCase().replace(/\.$/, "");
+  if (isIP(h.replace(/^\[|\]$/g, ""))) return false;
+  return !h.includes(".") || /(^|\.)(localhost|local|internal|home\.arpa|lan)$/.test(h);
+}
+
+/** True when connecting `hostname` at `address` must be refused. */
+export function isRefusedAddress(hostname: string, address: string): boolean {
+  if (!isPrivateAddress(address)) return false;
+  const literal = isIP(hostname.replace(/^\[|\]$/g, "")) !== 0;
+  return !(inOpenShell() && !literal && isIP(address) === 4 && PROXY_MAPPED.check(address, "ipv4"));
+}
+
 /**
  * DNS lookup used for the actual connection. Rejects private answers, so the socket can only
  * reach an address that passed the check (no DNS-rebinding window between check and connect).
@@ -71,7 +93,11 @@ export const guardedLookup: LookupFunction = (hostname, options, callback) => {
     if (err) return callback(err, "", 0);
     const list = addresses as LookupAddress[];
     if (!privateFetchAllowed()) {
-      const bad = list.find((a) => isPrivateAddress(a.address));
+      if (isInternalHostname(hostname)) {
+        const e = Object.assign(new Error(`${hostname} is a private/local address`), { code: "ERR_PRIVATE_ADDRESS" });
+        return callback(e, "", 0);
+      }
+      const bad = list.find((a) => isRefusedAddress(hostname, a.address));
       if (bad) {
         const e = Object.assign(new Error(`${hostname} resolves to a private/local address (${bad.address})`), {
           code: "ERR_PRIVATE_ADDRESS",
@@ -97,14 +123,25 @@ async function assertPublicUrl(url: URL): Promise<void> {
   }
   if (privateFetchAllowed()) return;
   const host = url.hostname.replace(/^\[|\]$/g, "");
+  if (isInternalHostname(host)) throw new ToolError(`Refusing to fetch ${url.hostname}: it is a private/local address.`);
   const addrs = isIP(host) ? [{ address: host }] : await lookup(host, { all: true }).catch(() => []);
   if (addrs.length === 0) throw new ToolError(`Could not resolve host ${url.hostname}`);
-  if (addrs.some((a) => isPrivateAddress(a.address))) {
+  if (addrs.some((a) => isRefusedAddress(host, a.address))) {
     throw new ToolError(`Refusing to fetch ${url.hostname}: it resolves to a private/local address.`);
   }
 }
 
 type FetchResponse = Awaited<ReturnType<typeof undiciFetch>>;
+
+/** What the model should tell the user when the OpenShell policy blocks a site. */
+function sandboxBlocked(url: URL): string {
+  const name = process.env.AGENT_SANDBOX_NAME || "<name>";
+  const port = url.port || (url.protocol === "https:" ? "443" : "80");
+  return (
+    `The sandbox's network policy does not allow ${url.hostname}:${port}. Do not retry. ` +
+    `Tell the user they can allow it with: make openshell-allow NAME=${name} HOST=${url.hostname}${port === "443" ? "" : ` PORT=${port}`}`
+  );
+}
 
 async function safeFetch(
   rawUrl: string,
@@ -135,6 +172,7 @@ async function safeFetch(
       if (e.name === "TimeoutError") throw new ToolError(`Timed out fetching ${url}`);
       if (e.name === "AbortError") throw e;
       if (e.cause?.code === "ERR_PRIVATE_ADDRESS") throw new ToolError(`Refusing to fetch ${url.hostname}: ${e.cause.message}.`);
+      if (inOpenShell() && ["EACCES", "ECONNRESET", "ECONNREFUSED"].includes(e.cause?.code)) throw new ToolError(sandboxBlocked(url));
       throw new ToolError(`Network error fetching ${url}: ${e.cause?.code ?? e.message}`);
     }
     const location = res.headers.get("location");
