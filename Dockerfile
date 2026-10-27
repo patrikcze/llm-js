@@ -1,16 +1,34 @@
 # syntax=docker/dockerfile:1
 # llm-agent web UI. Node runs the TypeScript sources directly (type stripping), so there is no build step.
-ARG NODE_VERSION=24
-FROM docker.io/library/node:${NODE_VERSION}-alpine
+#
+# Base image pinned to a patched Node.js release (24.22.1 fixes CVE-2026-111497, the Brotli decoder
+# RCE, among others) and to its digest, so a rebuild cannot silently pick up a different image.
+# Dependabot proposes updates (.github/dependabot.yml). Check what's inside: make docker-scan.
+FROM docker.io/library/node:24.22.1-alpine3.24@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53
 
 ENV NODE_ENV=production
 WORKDIR /app
 
-# Tools for the agent's run_command (it executes inside this container) and for grep (ripgrep).
-RUN apk add --no-cache bash git curl jq python3 ripgrep make tzdata
+# Alpine security updates first, then the tools for the agent's run_command (it executes inside this
+# container) and for grep (ripgrep). The npm bundled with Node lags behind on its own dependencies,
+# so it is updated; yarn 1 and corepack are unmaintained or unused here and are removed.
+ARG NPM_VERSION=12.2.1
+RUN apk upgrade --no-cache \
+ && apk add --no-cache bash git curl jq python3 ripgrep make tzdata \
+ && npm install -g --ignore-scripts npm@${NPM_VERSION} \
+ && rm -rf /opt/yarn-* /usr/local/bin/yarn /usr/local/bin/yarnpkg \
+           /usr/local/lib/node_modules/corepack /usr/local/bin/corepack \
+ && npm cache clean --force
 
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
+
+# The agent itself never runs npm, and even the latest npm bundles dependencies with open advisories
+# (its own copy of undici and ip-address). So npm is removed unless you ask for it, e.g. for an
+# agent that should install packages: make docker-build WITH_NPM=true
+ARG WITH_NPM=false
+RUN if [ "$WITH_NPM" != "true" ]; then \
+      rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx /root/.npm; fi
 
 COPY src ./src
 COPY web ./web

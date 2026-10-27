@@ -16,3 +16,6 @@ biome.json
 scripts
 .run
 coverage
+compose.docker.yml
+*.token
+.DS_Store

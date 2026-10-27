@@ -10,7 +10,10 @@
 #   docker compose -f docker-compose.yml -f compose.docker.yml up -d --build
 services:
   agent:
-    build: .
+    build:
+      context: .
+      args:
+        WITH_NPM: ${WITH_NPM:-false} # true keeps npm/npx in the image (see Dockerfile)
     image: llm-agent:latest
     container_name: llm-agent
     labels:
@@ -48,7 +51,8 @@ services:
     cpus: 2
 
   searxng:
-    image: docker.io/searxng/searxng:2026.10.25-54ca1d9cf
+    # Pinned release and digest; Dependabot proposes updates.
+    image: docker.io/searxng/searxng:2026.10.27-ef7bae9dd@sha256:64936ab0847aae6494d37edf688ce792b262e8467d48ad844c0bf3f899a45249
     container_name: llm-agent-searxng
     restart: unless-stopped
     ports:
@@ -57,7 +61,19 @@ services:
       - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
     environment:
       - SEARXNG_BASE_URL=http://127.0.0.1:8888/
-      - SEARXNG_SECRET=${SEARXNG_SECRET:-local-only-change-me}
+      - SEARXNG_SECRET=${SEARXNG_SECRET:-local-only-change-me} # make generates a random one
+      - FORCE_OWNERSHIP=false # runs unprivileged, so it must not try to chown
+    # Hardening: the image would run as root; run it as its own user with a read-only root file
+    # system, scratch tmpfs for its cache, no capabilities and no privilege gain.
+    user: "977:977" # searxng
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/cache/searxng:mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges"]
+    pids_limit: 256
+    mem_limit: 512m
 
 volumes:
   agent-config:

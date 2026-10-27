@@ -21,7 +21,9 @@ DOCKER    ?= $(shell command -v docker >/dev/null 2>&1 && echo docker || echo po
 # Detected once, and only when a container target needs it.
 ENGINE    ?= $(eval ENGINE := $(shell $(DOCKER) version 2>/dev/null | grep -qi podman && echo podman || echo docker))$(ENGINE)
 # compose.docker.yml adds what only Docker needs (host.docker.internal on Linux); Podman has it built in.
-COMPOSE   ?= $(DOCKER) compose -f docker-compose.yml $(if $(filter docker,$(ENGINE)),-f compose.docker.yml)
+# SearXNG gets a random secret per checkout (kept in .run/searxng.secret) instead of a fixed default.
+COMPOSE   ?= SEARXNG_SECRET=$$(mkdir -p .run; [ -s .run/searxng.secret ] || (umask 077; od -An -tx1 -N24 /dev/urandom | tr -d ' \n' > .run/searxng.secret); cat .run/searxng.secret) \
+             $(DOCKER) compose -f docker-compose.yml $(if $(filter docker,$(ENGINE)),-f compose.docker.yml)
 
 PORT      ?= 8787
 HOST      ?= 127.0.0.1
@@ -36,6 +38,9 @@ NAME        ?=
 AGENT_PORT  ?=
 AGENT_WS    ?= workspaces/$(NAME)
 AGENT_IMAGE ?= llm-agent:latest
+# true keeps npm/npx in the agent image (removed by default: see Dockerfile). Compose reads it from the environment.
+WITH_NPM    ?= false
+export WITH_NPM
 # Containers default to UTC; give them this machine's time zone so "local time" means yours.
 TZ          ?= $(shell $(NODE) -e "console.log(Intl.DateTimeFormat().resolvedOptions().timeZone)" 2>/dev/null || echo UTC)
 CONTAINER   := llm-agent-$(NAME)
@@ -77,7 +82,7 @@ port_free = { $(NODE) -e "const s=require('net').createServer().once('error',()=
 .PHONY: help setup install doctor \
         start stop restart status logs open dev cli run \
         check ci lint fix format format-check typecheck test test-watch coverage audit \
-        docker-build docker-up docker-down docker-restart docker-logs docker-ps docker-shell search-up search-down \
+        docker-build docker-scan docker-up docker-down docker-restart docker-logs docker-ps docker-shell search-up search-down \
         agent-up agent-down agent-cleanup agent-open agents agent-logs agent-shell docker-open searxng-attach \
         clean distclean
 
@@ -210,6 +215,11 @@ audit: ## Audit production dependencies for known vulnerabilities
 
 docker-build: ## Build the agent image
 	$(COMPOSE) build agent
+
+docker-scan: ## Scan the agent image for known vulnerabilities (Docker Scout or Trivy)
+	@if command -v trivy >/dev/null 2>&1; then trivy image --scanners vuln --severity LOW,MEDIUM,HIGH,CRITICAL $(AGENT_IMAGE); \
+	elif [ "$(ENGINE)" = docker ] && docker scout version >/dev/null 2>&1; then docker scout cves $(AGENT_IMAGE); \
+	else echo "No scanner found: install Trivy (brew install trivy) or Docker Scout." >&2; exit 1; fi
 
 docker-up: ## Build and start the default agent + SearXNG (with NAME=…: an isolated agent, same as agent-up)
 ifneq ($(NAME),)
