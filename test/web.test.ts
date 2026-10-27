@@ -3,6 +3,9 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, before, describe, it } from "node:test";
 import {
+  botWall,
+  consentRedirect,
+  decodeBody,
   fetchImage,
   guardedLookup,
   htmlToMarkdown,
@@ -28,6 +31,50 @@ describe("htmlToMarkdown", () => {
     assert.match(markdown, /quick brown fox/);
     assert.match(markdown, /\[more details\]\(https:\/\/example\.com\/more\)/);
     assert.doesNotMatch(markdown, /alert/);
+  });
+
+  it("keeps a whole homepage instead of the one teaser reader mode would pick", () => {
+    const teasers = Array.from(
+      { length: 30 },
+      (_, i) =>
+        `<article><header><h2><a href="/a/${i}">Headline number ${i}</a></h2></header><p>Teaser text for story ${i}, long enough to read.</p></article>`,
+    ).join("");
+    const html = `<html><head><title>News</title></head><body><header>Site menu</header><nav>Home | World</nav>
+      <form id="aspnet"><main>${teasers}</main></form>
+      <footer><p>${"Copyright and legal notes. ".repeat(20)}</p></footer></body></html>`;
+    const { markdown } = htmlToMarkdown(html, "https://news.example/");
+    assert.match(markdown, /Headline number 0/);
+    assert.match(markdown, /Headline number 29/); // every teaser, with its article <header>
+    assert.match(markdown, /\(https:\/\/news\.example\/a\/29\)/);
+    assert.doesNotMatch(markdown, /Site menu|Copyright and legal/);
+  });
+});
+
+describe("page decoding and walls", () => {
+  it("decodes the declared charset (header, then <meta>), defaulting to UTF-8", () => {
+    const cz = Buffer.from([0x50, 0x6f, 0x6b, 0x72, 0x61, 0xe8, 0x6f, 0x76, 0x61, 0x74]); // "Pokračovat" in windows-1250
+    assert.equal(decodeBody(cz, "text/html; charset=windows-1250"), "Pokračovat");
+    const meta = Buffer.concat([Buffer.from('<meta charset="windows-1250">'), cz]);
+    assert.match(decodeBody(meta, "text/html"), /Pokračovat$/);
+    assert.equal(decodeBody(Buffer.from("Pokračovat"), "text/html"), "Pokračovat");
+    assert.equal(decodeBody(Buffer.from("ok"), "text/html; charset=no-such-charset"), "ok");
+  });
+
+  it("recognizes bot-check pages, but not normal pages that embed those services", () => {
+    assert.equal(botWall("<html><head><title>Just a moment...</title></head>", 403), "Cloudflare");
+    assert.equal(botWall("<html><head><title>x</title><style>#cmsg{animation: A 1.5s;}</style></head>", 401), "DataDome");
+    assert.equal(
+      botWall('<script src="https://js.datadome.co/tags.js"></script><div class="g-recaptcha"></div><p>Sign in</p>', 200),
+      undefined,
+    );
+    assert.equal(botWall("<html><body>Regular article</body></html>", 200), undefined);
+  });
+
+  it("notices a redirect to a cookie-consent page", () => {
+    assert.equal(consentRedirect("https://www.idnes.cz/a", "https://www.idnes.cz/nastaveni-souhlasu?url=x"), true);
+    assert.equal(consentRedirect("https://www.youtube.com/watch?v=1", "https://consent.youtube.com/m?continue=x"), true);
+    assert.equal(consentRedirect("http://example.com/a", "https://example.com/a"), false);
+    assert.equal(consentRedirect("https://example.com/a", "https://example.com/b"), false);
   });
 });
 
@@ -115,6 +162,17 @@ describe("web_fetch", () => {
       if (req.url === "/img.png") return res.writeHead(200, { "content-type": "image/png" }).end(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
       if (req.url === "/img.svg") return res.writeHead(200, { "content-type": "image/svg+xml" }).end("<svg onload=alert(1)/>");
       if (req.url === "/huge.png") return res.writeHead(200, { "content-type": "image/png", "content-length": String(50_000_000) }).end();
+      // A cookie check: /check sends you to /set without its cookie, /set sets it and sends you back.
+      if (req.url === "/check")
+        return /seen=1/.test(req.headers.cookie ?? "")
+          ? res
+              .writeHead(200, { "content-type": "text/html" })
+              .end(`<html><title>Checked</title><body><p>${"Cookie check passed. ".repeat(20)}</p></body></html>`)
+          : res.writeHead(302, { location: "/set" }).end();
+      if (req.url === "/set")
+        return res.writeHead(302, { location: "/check", "set-cookie": ["seen=1; Path=/", "other=1; Domain=evil.example"] }).end();
+      if (req.url === "/cf")
+        return res.writeHead(403, { "content-type": "text/html" }).end("<html><head><title>Just a moment...</title></head></html>");
       res.writeHead(404).end("nope");
     });
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
@@ -177,6 +235,12 @@ describe("web_fetch", () => {
       assert.match(await webFetchTool.run({ url: `${base}/json` }, ctx), /"a": 1/);
       await assert.rejects(webFetchTool.run({ url: `${base}/missing` }, ctx), /HTTP 404/);
       await assert.rejects(webFetchTool.run({ url: `${base}/bin` }, ctx), /Unsupported content type/);
+      // Cookies set during one fetch go back on its later hops (and only to their own site).
+      assert.match(await webFetchTool.run({ url: `${base}/check` }, ctx), /Cookie check passed/);
+      await assert.rejects(
+        webFetchTool.run({ url: `${base}/cf` }, ctx),
+        /blocks automated readers \(Cloudflare bot check, HTTP 403\)\. Do not retry/,
+      );
       // Never asks arbitrary servers for Brotli (defense in depth for decoder bugs).
       assert.ok(encodings.length > 0 && encodings.every((e) => e === "gzip, deflate"), encodings.join(" | "));
     } finally {

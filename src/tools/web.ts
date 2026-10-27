@@ -4,7 +4,7 @@ import { BlockList, isIP, type LookupFunction } from "node:net";
 import { Readability } from "@mozilla/readability";
 import { parseHTML } from "linkedom";
 import TurndownService from "turndown";
-import { Agent, fetch as undiciFetch } from "undici";
+import { Agent, getSetCookies, fetch as undiciFetch } from "undici";
 import { type Tool, type ToolContext, ToolError, truncate } from "./types.ts";
 
 const USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
@@ -162,9 +162,17 @@ async function safeFetch(
   }
   const requested = url;
   const signal = AbortSignal.any([ctx.signal, AbortSignal.timeout(FETCH_TIMEOUT_MS)]);
+  // Cookies set during this one fetch, sent back on its later redirect hops: consent and cookie-check
+  // redirects (set a cookie, then send you back) need that. Nothing is kept between fetches.
+  const jar = new Map<string, { domain: string; value: string }>();
   // Follow redirects by hand so every hop goes through the address check.
-  for (let hop = 0; hop < 6; hop++) {
+  for (let hop = 0; hop < 8; hop++) {
     await assertPublicUrl(url);
+    const host = url.hostname.toLowerCase();
+    const cookie = [...jar.entries()]
+      .filter(([, c]) => host === c.domain || host.endsWith(`.${c.domain}`))
+      .map(([key, c]) => `${key.slice(key.indexOf(" ") + 1)}=${c.value}`)
+      .join("; ");
     let res: FetchResponse;
     try {
       res = await undiciFetch(url, {
@@ -173,7 +181,13 @@ async function safeFetch(
         signal,
         dispatcher,
         // No Brotli from arbitrary servers: defense in depth for decoder bugs like CVE-2026-111497.
-        headers: { "User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9", "Accept-Encoding": "gzip, deflate", ...init.headers },
+        headers: {
+          "User-Agent": USER_AGENT,
+          "Accept-Language": "en-US,en;q=0.9",
+          "Accept-Encoding": "gzip, deflate",
+          ...(cookie ? { Cookie: cookie } : {}),
+          ...init.headers,
+        },
       });
     } catch (e: any) {
       if (e.name === "TimeoutError") throw new ToolError(`Timed out fetching ${url}`);
@@ -182,6 +196,13 @@ async function safeFetch(
       if (inOpenShell() && ["EACCES", "ECONNRESET", "ECONNREFUSED"].includes(e.cause?.code))
         throw new ToolError(sandboxBlocked(url, requested));
       throw new ToolError(`Network error fetching ${url}: ${e.cause?.code ?? e.message}`);
+    }
+    for (const c of getSetCookies(res.headers as any)) {
+      const domain = (c.domain ?? host).replace(/^\./, "").toLowerCase();
+      if (host !== domain && !host.endsWith(`.${domain}`)) continue; // a cookie for another site: ignore
+      const key = `${domain} ${c.name}`;
+      if (c.value === "" || (c.maxAge !== undefined && c.maxAge <= 0)) jar.delete(key);
+      else jar.set(key, { domain, value: c.value });
     }
     const location = res.headers.get("location");
     if (res.status >= 300 && res.status < 400 && location) {
@@ -210,7 +231,24 @@ async function readBody(res: FetchResponse): Promise<string> {
     }
     chunks.push(value);
   }
-  return new TextDecoder().decode(Buffer.concat(chunks));
+  return decodeBody(Buffer.concat(chunks), res.headers.get("content-type") ?? "");
+}
+
+/**
+ * Decodes a page in its declared encoding: the Content-Type charset, else a BOM, else <meta charset>
+ * in the first bytes, else UTF-8. Many sites (Czech, Polish, Japanese ...) still serve windows-1250,
+ * iso-8859-2, shift_jis and the like, which come out garbled when read as UTF-8.
+ */
+export function decodeBody(bytes: Uint8Array, contentType: string): string {
+  const declared =
+    contentType.match(/charset=["']?([\w.:-]+)/i)?.[1] ??
+    (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf ? "utf-8" : undefined) ??
+    new TextDecoder("latin1").decode(bytes.subarray(0, 4096)).match(/<meta[^>]+charset=["']?([\w.:-]+)/i)?.[1];
+  try {
+    return new TextDecoder(declared ?? "utf-8").decode(bytes);
+  } catch {
+    return new TextDecoder().decode(bytes); // unknown label: fall back to UTF-8
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -280,22 +318,83 @@ export function htmlToMarkdown(html: string, url: string): { title: string; mark
     } catch {}
   }
   let title = document.title?.trim() ?? "";
+  // The page without chrome: its <main> when that holds real content, else the body.
+  const { document: page } = parseHTML(html);
+  // Not <form>: some sites (ASP.NET) wrap the whole page in one.
+  for (const el of page.querySelectorAll("script,style,noscript,template,svg,nav,aside,dialog")) el.remove();
+  // Page-level header and footer only: inside an article they often hold its headline or byline.
+  for (const el of page.querySelectorAll("header,footer")) if (!el.parentElement?.closest("article,main,[role=main]")) el.remove();
+  for (const a of page.querySelectorAll("a[href]")) {
+    try {
+      a.setAttribute("href", new URL(a.getAttribute("href")!, url).href);
+    } catch {}
+  }
+  const main = page.querySelector("main,[role=main]");
+  const textOf = (n: { textContent: string | null } | null | undefined) => (n?.textContent ?? "").replace(/\s+/g, " ").trim().length;
+  // A page without <head> can leave the parser with an empty <body> and the content after it.
+  const body = textOf(page.body) > 0 ? page.body : page.documentElement;
+  const whole = textOf(main) >= 500 ? main! : body;
+  const wholeLength = textOf(whole);
+  // Reader mode (Readability) is right for articles, but on homepages, listings and app-style pages it
+  // keeps one teaser and drops the rest. Use it only when it captures a fair share of the page's text.
   let contentHtml: string;
   const article = new Readability(document as any, { charThreshold: 200 }).parse();
-  if (article?.content && (article.textContent?.trim().length ?? 0) > 200) {
+  const articleLength = (article?.textContent ?? "").replace(/\s+/g, " ").trim().length;
+  if (article?.content && articleLength > 200 && articleLength >= 0.4 * wholeLength) {
     title = article.title?.trim() || title;
     contentHtml = article.content;
   } else {
-    // Readability gave up (search pages, app shells...). Fall back to the whole body.
-    const { document: fresh } = parseHTML(html);
-    for (const el of fresh.querySelectorAll("script,style,noscript,nav,header,footer,svg")) el.remove();
-    contentHtml = fresh.body?.innerHTML ?? html;
+    contentHtml = whole?.innerHTML ?? html;
   }
   const markdown = turndown
     .turndown(contentHtml)
     .replace(/\n{3,}/g, "\n\n")
     .trim();
   return { title, markdown };
+}
+
+/** True when a fetch of `requested` ended on what looks like a cookie-consent page instead. */
+export function consentRedirect(requested: string, final: string): boolean {
+  try {
+    const r = new URL(requested);
+    const f = new URL(final);
+    if (f.hostname === r.hostname && f.pathname === r.pathname) return false;
+    return /(^|\.)(consent|cmp)\.|consent|souhlas|zgoda|einwilligung|cookie-?(wall|settings|consent)|privacy-gateway|gdpr/i.test(
+      f.hostname + f.pathname,
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Recognizes the challenge pages of common bot-protection services. Normal pages often embed these
+ * services' scripts or a login CAPTCHA, so a successful (2xx) page only counts when it is the challenge
+ * itself; an error response may match more loosely.
+ */
+export function botWall(html: string, status: number): string | undefined {
+  const head = html.slice(0, 20_000);
+  const failed = status >= 400;
+  if (/<title>\s*Just a moment\.\.\.\s*<\/title>|cf-chl-|Attention Required! \| Cloudflare/i.test(head)) return "Cloudflare";
+  if (/geo\.captcha-delivery\.com|ct\.captcha-delivery\.com/i.test(head) || (failed && html.length < 5000 && /#cmsg\b/.test(head)))
+    return "DataDome";
+  if (/id="px-captcha"/i.test(head)) return "PerimeterX";
+  if (failed && /<title>\s*Access Denied\s*<\/title>[\s\S]*Reference #/i.test(head)) return "Akamai";
+  if (failed && /g-recaptcha|hcaptcha\.com|verify you are (a )?human/i.test(head)) return "CAPTCHA";
+  return undefined;
+}
+
+/**
+ * What the model should do when a site refuses automated readers: stop, say so, use other sources.
+ * web_fetch does not try to get around these checks.
+ */
+function blockedByBotCheck(url: string, wall: string, status: number): string {
+  const host = new URL(url).hostname;
+  return (
+    `${host} blocks automated readers (${wall} bot check, HTTP ${status}). Do not retry and do not try to work around it. ` +
+    "Tell the user this page could not be read, and use other sources (web_search for other coverage, or the site's RSS feed) instead. " +
+    "Do not present search snippets as if you had read the page."
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -329,6 +428,8 @@ export const webFetchTool: Tool<{ url: string; start_index?: number; max_length?
     const type = (res.headers.get("content-type") ?? "").toLowerCase();
     if (!res.ok) {
       const body = await readBody(res).catch(() => "");
+      const wall = botWall(body, res.status);
+      if (wall) throw new ToolError(blockedByBotCheck(res.url || url, wall, res.status));
       throw new ToolError(`HTTP ${res.status} ${res.statusText} for ${url}${body ? `\n${body.slice(0, 500)}` : ""}`);
     }
     const isText = /text\/|json|xml|javascript|yaml|markdown/.test(type) || type === "";
@@ -337,6 +438,9 @@ export const webFetchTool: Tool<{ url: string; start_index?: number; max_length?
       throw new ToolError(`Unsupported content type "${type}" at ${url}. Only text, HTML and JSON can be read.`);
     }
     const raw = await readBody(res);
+    // Some bot checks answer 200 with a challenge page instead of the content.
+    const wall = botWall(raw, res.status);
+    if (wall) throw new ToolError(blockedByBotCheck(res.url || url, wall, res.status));
     let title = "";
     let content: string;
     if (type.includes("html") || (type === "" && /<html|<!doctype html/i.test(raw.slice(0, 1000)))) {
@@ -354,7 +458,15 @@ export const webFetchTool: Tool<{ url: string; start_index?: number; max_length?
     if (start_index >= total && total > 0) throw new ToolError(`start_index ${start_index} is past the end (${total} chars).`);
     const slice = content.slice(start_index, start_index + max_length);
     const end = start_index + slice.length;
-    const header = [`URL: ${res.url || url}`, title && `Title: ${title}`, `Showing characters ${start_index}-${end} of ${total}`]
+    const finalUrl = res.url || url;
+    const header = [
+      `URL: ${finalUrl}`,
+      consentRedirect(url, finalUrl) &&
+        `Note: the site redirected this request to a cookie-consent page (${new URL(finalUrl).hostname}), so this is not the requested page. ` +
+          "web_fetch does not give consent on the user's behalf: tell the user, and use other sources for the content.",
+      title && `Title: ${title}`,
+      `Showing characters ${start_index}-${end} of ${total}`,
+    ]
       .filter(Boolean)
       .join("\n");
     const more = end < total ? `\n\n[More content available: call web_fetch with start_index=${end}]` : "";
