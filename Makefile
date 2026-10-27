@@ -11,8 +11,15 @@ NODE      ?= node
 NPM       ?= npm
 BIOME     ?= npx --no-install biome
 TSC       ?= npx --no-install tsc
-COMPOSE   ?= docker compose
-DOCKER    ?= docker
+
+# Container engine: Docker or Podman, whichever is installed (docker wins when both are). ENGINE is
+# what actually answers: a `docker` CLI can be Podman's docker shim or talk to a Podman socket.
+# Override any of these: make docker-up DOCKER=podman, ENGINE=podman, COMPOSE="podman-compose".
+DOCKER    ?= $(shell command -v docker >/dev/null 2>&1 && echo docker || echo podman)
+# Detected once, and only when a container target needs it.
+ENGINE    ?= $(eval ENGINE := $(shell $(DOCKER) version 2>/dev/null | grep -qi podman && echo podman || echo docker))$(ENGINE)
+# compose.docker.yml adds what only Docker needs (host.docker.internal on Linux); Podman has it built in.
+COMPOSE   ?= $(DOCKER) compose -f docker-compose.yml $(if $(filter docker,$(ENGINE)),-f compose.docker.yml)
 
 PORT      ?= 8787
 HOST      ?= 127.0.0.1
@@ -36,8 +43,10 @@ AGENT_TOKEN_FILE = $(RUN_DIR)/agent-$(NAME).token
 # The image inherits Compose's labels (project llm-js, service agent); agent-up overrides them so
 # Docker Desktop shows isolated agents as their own "llm-agents" group, apart from the default stack.
 # Same hardening as the compose agent: read-only root, scratch tmpfs, no capabilities, limits.
-HARDENING   := --read-only --tmpfs /tmp --tmpfs /home/node:uid=1000,gid=1000,mode=0755 \
-               --cap-drop ALL --security-opt no-new-privileges:true --pids-limit 512 --memory 2g --cpus 2
+# Only options both Docker and Podman accept (Podman's tmpfs has no uid=/gid=, hence mode=1777).
+LIMITS      ?= --pids-limit 512 --memory 2g --cpus 2
+HARDENING   := --read-only --tmpfs /tmp --tmpfs /home/node:mode=1777 \
+               --cap-drop ALL --security-opt no-new-privileges $(LIMITS)
 
 RUN_DIR   := .run
 PID_FILE  := $(RUN_DIR)/server.pid
@@ -89,7 +98,7 @@ install: ## Install dependencies exactly as locked (npm ci)
 	$(NPM) ci
 
 doctor: ## Check Node, dependencies, LLM endpoint, search, port and Docker
-	@PORT=$(PORT) HOST=$(HOST) $(NODE) scripts/doctor.ts
+	@PORT=$(PORT) HOST=$(HOST) DOCKER=$(DOCKER) $(NODE) scripts/doctor.ts
 
 ##@ Server (background, PID in .run/)
 
@@ -261,7 +270,7 @@ agent-up: ## Start an isolated agent: make agent-up NAME=alpha [AGENT_PORT=8801]
 	  --network $(NET) -p 127.0.0.1:$$port:8787 -e AGENT_TOKEN=$$tok -e "AGENT_OPEN_HINT=make agent-open NAME=$(NAME)" \
 	  $$([ -f .env ] && echo --env-file .env) \
 	  -e LLM_BASE_URL=$${DOCKER_LLM_BASE_URL:-http://host.docker.internal:9931/v1} -e SEARXNG_URL=http://searxng:8080 -e TZ=$(TZ) \
-	  --add-host host.docker.internal:host-gateway \
+	  $(if $(filter docker,$(ENGINE)),--add-host host.docker.internal:host-gateway) \
 	  -v "$$ws":/workspace -v $(CONTAINER)-config:/config \
 	  $(HARDENING) $(AGENT_IMAGE) node src/server.ts -w /workspace --mode $(MODE) $(if $(THINK),--think $(THINK),) >/dev/null || { $(MAKE) --no-print-directory agent-cleanup NAME=$(NAME); exit 1; }; \
 	for i in $$(seq 1 60); do \
@@ -292,7 +301,7 @@ agent-open: ## Open an agent's UI in your browser: make agent-open NAME=alpha
 	command -v open >/dev/null && open "$$u" || xdg-open "$$u" >/dev/null 2>&1 || echo "$$u"
 
 agents: ## List isolated agents
-	@$(DOCKER) ps -a --filter label=llm-agent.name --format 'table {{.Label "llm-agent.name"}}\t{{.Status}}\t{{.Ports}}\t{{.Names}}'
+	@$(DOCKER) ps -a --filter label=llm-agent.name --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
 	@echo "Open one signed in: make agent-open NAME=<name> (the default agent: make docker-open)"
 
 docker-open: ## Open the default Docker agent's UI with its access token

@@ -118,12 +118,23 @@ else {
   report(free ? "ok" : "warn", "UI server", free ? `port ${port} free` : `port ${port} is used by another program`);
 }
 
-try {
-  const { stdout } = await promisify(execFile)("docker", ["info", "--format", "{{.ServerVersion}}"], { timeout: 5000 });
-  report("ok", "Docker", `engine ${stdout.trim()}`);
-} catch (e: any) {
-  report("warn", "Docker", e.code === "ENOENT" ? "not installed (optional)" : "daemon not running (optional)");
+// Docker or Podman (the Makefile passes DOCKER); a `docker` CLI may also be talking to Podman.
+const engines = process.env.DOCKER ? [process.env.DOCKER] : ["docker", "podman"];
+let engineNote = "not installed (optional)";
+for (const cli of engines) {
+  try {
+    await promisify(execFile)(cli, ["info"], { timeout: 5000 });
+    const { stdout } = await promisify(execFile)(cli, ["version"], { timeout: 5000 });
+    const name = /podman/i.test(stdout) ? "Podman" : "Docker";
+    const version = (await promisify(execFile)(cli, ["version", "--format", "{{.Server.Version}}"], { timeout: 5000 })).stdout.trim();
+    report("ok", "Containers", `${name} ${version} via \`${cli}\``);
+    engineNote = "";
+    break;
+  } catch (e: any) {
+    if (e.code !== "ENOENT") engineNote = `\`${cli}\` installed, engine not running (optional)`;
+  }
 }
+if (engineNote) report("warn", "Containers", engineNote);
 
 console.log(failed ? paint(31, `\n${failed} required check(s) failed.`) : paint(32, "\nAll required checks passed."));
 process.exit(failed ? 1 : 0);

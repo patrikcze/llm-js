@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # llm-agent web UI. Node runs the TypeScript sources directly (type stripping), so there is no build step.
 ARG NODE_VERSION=24
-FROM node:${NODE_VERSION}-alpine
+FROM docker.io/library/node:${NODE_VERSION}-alpine
 
 ENV NODE_ENV=production
 WORKDIR /app

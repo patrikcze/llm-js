@@ -1,0 +1,6 @@
+# Docker-only additions to docker-compose.yml (the Makefile adds this file when the engine is Docker).
+# Podman provides host.docker.internal itself; forcing host-gateway there can point at the VM instead.
+services:
+  agent:
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # needed on Linux; Docker Desktop provides it already

@@ -5,6 +5,9 @@
 # The LLM is NOT in this stack. By default the agent talks to a server on your host
 # (llama.cpp / Ollama / LM Studio) through host.docker.internal, or to OpenAI / Anthropic
 # once you pick them in the UI's config window.
+#
+# Works with Docker and Podman. With Docker add compose.docker.yml (the Makefile does):
+#   docker compose -f docker-compose.yml -f compose.docker.yml up -d --build
 services:
   agent:
     build: .
@@ -29,8 +32,6 @@ services:
       # Empty = random per start, shown in `docker compose logs agent`.
       AGENT_TOKEN: ${AGENT_TOKEN:-}
       AGENT_OPEN_HINT: make docker-open
-    extra_hosts:
-      - "host.docker.internal:host-gateway" # needed on Linux; Docker Desktop provides it already
     volumes:
       - ${AGENT_WORKSPACE:-./playground}:/workspace
       - agent-config:/config
@@ -39,15 +40,15 @@ services:
     read_only: true
     tmpfs:
       - /tmp
-      - /home/node:uid=1000,gid=1000,mode=0755
+      - /home/node:mode=1777 # Podman's tmpfs has no uid=/gid= options
     cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
+    security_opt: ["no-new-privileges"]
     pids_limit: 512
     mem_limit: 2g
     cpus: 2
 
   searxng:
-    image: searxng/searxng:2026.10.25-54ca1d9cf
+    image: docker.io/searxng/searxng:2026.10.25-54ca1d9cf
     container_name: llm-agent-searxng
     restart: unless-stopped
     ports:

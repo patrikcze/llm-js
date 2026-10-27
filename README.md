@@ -38,7 +38,7 @@ Run `make` to list everything. These are the common ones:
 | Command | What it does |
 |---|---|
 | `make setup` | `npm ci`, create `.env` from the example, run `doctor` |
-| `make doctor` | Check Node ≥ 22.18, dependencies, the LLM endpoint, search, the port and Docker |
+| `make doctor` | Check Node ≥ 22.18, dependencies, the LLM endpoint, search, the port and Docker/Podman |
 | `make start` / `stop` / `restart` / `status` / `logs` | Run the web UI in the background (PID and log in `.run/`), wait until healthy, show provider/model |
 | `make dev` | Foreground server that restarts when `src/` or `web/` change |
 | `make cli`, `make run TASK="…"` | Terminal chat, or a one-shot task |
@@ -137,6 +137,18 @@ AGENT_WORKSPACE=~/code/my-project make docker-up AGENT_PORT=8800
 `make docker-up` keeps one token in `.run/docker.token` across restarts. Plain `docker compose up` (and the `npm run docker:*` scripts) also work, but then the token is random per start and only shown in the log: `docker compose logs agent | grep Open:`.
 
 On Linux, the container user (uid 1000) needs write access to the mounted workspace.
+
+### Docker or Podman
+
+Every container target works with either engine. The Makefile uses `docker` if it is installed, otherwise `podman`, and checks which engine actually answers (a `docker` CLI can be Podman's shim or point at a Podman socket). `make doctor` shows what it found. Override when needed:
+
+```bash
+make docker-up DOCKER=podman                    # force Podman when both are installed
+make docker-up COMPOSE="podman-compose"         # a different Compose implementation
+make agent-up NAME=x LIMITS=                    # drop --memory/--cpus/--pids-limit (rootless Podman without cgroup delegation)
+```
+
+Only options both engines accept are used: `/home/node` is a `mode=1777` tmpfs (Podman's tmpfs has no `uid=`/`gid=`), and `no-new-privileges` is given without `:true`. `host.docker.internal` is built into Podman; with Docker the Makefile adds [compose.docker.yml](compose.docker.yml), which maps it to `host-gateway` (needed on Linux). Running Compose by hand with Docker on Linux: `docker compose -f docker-compose.yml -f compose.docker.yml up -d`. Images use fully qualified names (`docker.io/...`), so Podman never has to ask which registry to use.
 
 ### Where does it run? Local vs container, and many agents
 
