@@ -9,8 +9,10 @@ SHELL := /bin/bash
 # --- configuration --------------------------------------------------------------------------
 NODE      ?= node
 NPM       ?= npm
-BIOME     ?= npx --no-install biome
-TSC       ?= npx --no-install tsc
+BIOME     ?= node_modules/.bin/biome
+TSC       ?= node_modules/.bin/tsc
+# Written by npm ci; targets that need Node dependencies install them first when it is missing or stale.
+DEPS      := node_modules/.package-lock.json
 
 # Container engine: Docker or Podman, whichever is installed (docker wins when both are). ENGINE is
 # what actually answers: a `docker` CLI can be Podman's docker shim or talk to a Podman socket.
@@ -97,12 +99,17 @@ setup: install ## First-time setup: dependencies, .env, workspace, then a health
 install: ## Install dependencies exactly as locked (npm ci)
 	$(NPM) ci
 
+$(DEPS): package.json package-lock.json
+	@echo "Installing dependencies (npm ci)…"
+	$(NPM) ci
+	@touch $@
+
 doctor: ## Check Node, dependencies, LLM endpoint, search, port and Docker
 	@PORT=$(PORT) HOST=$(HOST) DOCKER=$(DOCKER) $(NODE) scripts/doctor.ts
 
 ##@ Server (background, PID in .run/)
 
-start: ## Start the web UI in the background and wait until it is healthy
+start: $(DEPS) ## Start the web UI in the background and wait until it is healthy
 	@mkdir -p $(RUN_DIR) $(WORKSPACE)
 	@if $(is_running); then \
 	  if [ -s $(TOKEN_FILE) ]; then echo "Already running (pid $$(cat $(PID_FILE))). Open: $(URL)/?token=$$(cat $(TOKEN_FILE))"; \
@@ -151,14 +158,14 @@ open: ## Open the web UI in your browser
 	@u="$(URL)/?token=$$(cat $(TOKEN_FILE) 2>/dev/null)"; \
 	command -v open >/dev/null && open "$$u" || xdg-open "$$u" >/dev/null 2>&1 || echo "$$u"
 
-dev: ## Run the web UI in the foreground, restarting on file changes
+dev: $(DEPS) ## Run the web UI in the foreground, restarting on file changes
 	@mkdir -p $(WORKSPACE)
 	HOST=$(HOST) $(NODE) --watch-path=src --watch-path=web src/server.ts $(SERVER_ARGS)
 
-cli: ## Interactive terminal chat in WORKSPACE
+cli: $(DEPS) ## Interactive terminal chat in WORKSPACE
 	$(NODE) src/cli.ts $(CLI_ARGS)
 
-run: ## One-shot task: make run TASK="summarise README.md"
+run: $(DEPS) ## One-shot task: make run TASK="summarise README.md"
 	@[ -n "$(TASK)" ] || { echo 'Usage: make run TASK="what to do"' >&2; exit 2; }
 	$(NODE) src/cli.ts $(CLI_ARGS) "$(TASK)"
 
@@ -169,31 +176,31 @@ check: ## Everything CI checks: lint + format, types, tests
 
 ci: check audit ## check + dependency audit
 
-lint: ## Lint (Biome)
+lint: $(DEPS) ## Lint (Biome)
 	$(BIOME) lint
 
-lint-ci:
+lint-ci: $(DEPS)
 	$(BIOME) ci
 
-fix: ## Apply safe lint fixes, formatting and import sorting
+fix: $(DEPS) ## Apply safe lint fixes, formatting and import sorting
 	$(BIOME) check --write
 
-format: ## Format the code
+format: $(DEPS) ## Format the code
 	$(BIOME) format --write
 
-format-check: ## Fail if code is not formatted
+format-check: $(DEPS) ## Fail if code is not formatted
 	$(BIOME) format
 
-typecheck: ## Type-check with tsc (no emit)
+typecheck: $(DEPS) ## Type-check with tsc (no emit)
 	$(TSC) -p .
 
-test: ## Run the test suite
+test: $(DEPS) ## Run the test suite
 	$(NODE) --test $(TESTS)
 
-test-watch: ## Re-run tests on change
+test-watch: $(DEPS) ## Re-run tests on change
 	$(NODE) --test --watch $(TESTS)
 
-coverage: ## Tests with a coverage report
+coverage: $(DEPS) ## Tests with a coverage report
 	$(NODE) --test --experimental-test-coverage --test-coverage-include='src/**' $(TESTS)
 
 audit: ## Audit production dependencies for known vulnerabilities

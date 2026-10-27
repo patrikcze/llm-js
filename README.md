@@ -33,7 +33,7 @@ Click **⚙ Config** (or the model name) in the UI to choose a provider and mode
 
 ## Make targets
 
-Run `make` to list everything. These are the common ones:
+Run `make` to list everything. Targets that need Node dependencies (`start`, `check`, `test`, …) run `npm ci` first when `node_modules` is missing or older than `package-lock.json`; the Docker targets don't need them. These are the common ones:
 
 | Command | What it does |
 |---|---|
